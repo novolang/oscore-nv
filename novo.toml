@@ -19,4 +19,4 @@ novo        = ">= 0.23.0"
 
 [dependencies]
 crypto-nv = "^0.1.8"
-coap-nv   = { path = "../coap-nv" }
+coap-nv   = "^0.1.0"
