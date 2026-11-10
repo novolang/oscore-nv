@@ -1,0 +1,331 @@
+// oscopt.nv — the OSCORE option, and the reading and writing of CoAP options.
+//
+// THE OPTION VALUE (RFC 8613 section 6.1).  The compressed COSE object travels
+// in two places: its header parameters in the value of the OSCORE option,
+// number 9, and its ciphertext as the payload of the message.  The value is
+//
+//   flags | Partial IV | s | kid context | kid
+//
+//   flags   0 0 0 h k n n n    nnn = the length of the Partial IV, 0 to 5
+//                              k   = a `kid` follows
+//                              h   = a `kid context` follows
+//   s       one byte, the length of the kid context, present when h is set
+//
+// The `kid` is last and takes the rest of the value.  The three high bits are
+// reserved and a value with one set is malformed, as is a Partial IV length of 6
+// or 7.  When there is nothing to say, no flag and no Partial IV, the option is
+// empty and not a lone zero byte (section 6.3, example 4).
+//
+// COAP OPTIONS (RFC 7252 section 3.1).  An option is a delta from the number of
+// the option before it, a length, and a value; the first byte holds the delta
+// in its high nibble and the length in its low one, and a nibble of 13 or 14
+// says that one or two bytes more extend it.  OSCORE reads the options of a
+// message, writes some of them to the plaintext and some to the outer message,
+// and so needs to read and write them in both: the plaintext and a CoAP message
+// are both a `Vec[u8; 1152]`, and the two functions here work on either.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.
+
+use oscctx
+
+// The number of the OSCORE option.
+pub const OSC_OPT_OSCORE = 9
+// The size of the longest option value this package writes: 1 + 5 + 1 + 32 + 7.
+pub const OSC_OPTVAL_MAX = 48
+
+// A buffer for an OSCORE option value.
+pub alias OptVal = Vec[u8; 48]
+// A CoAP message or an OSCORE plaintext.
+pub alias OscMsg = Vec[u8; 1152]
+
+// An OSCORE option value, read.
+//
+// `ok` is false for a value that is malformed; no other field means anything
+// then.  `piv_len` is 0 when there is no Partial IV, otherwise `piv` is its
+// value.  `has_kid` and `kid`, `kid_len`; `has_ctx` and `ctx` (the kid context
+// copied out).
+pub @value
+struct OscOption
+    ok: Bool
+    piv: Int
+    piv_len: Int
+    has_kid: Bool
+    kid: Int
+    kid_len: Int
+    has_ctx: Bool
+    ctx: IdContext
+
+// A value that is not well formed.
+@tier(embedded)
+@no_alloc
+fn bad_option() -> OscOption
+    OscOption { ok: false,
+        piv: 0,
+        piv_len: 0,
+        has_kid: false,
+        kid: 0,
+        kid_len: 0,
+        has_ctx: false,
+        ctx: Vec.new() }
+
+// Read the OSCORE option value of `len` bytes at `off` of a message.
+//
+// Refuses (`ok` false) a reserved flag bit, a Partial IV length of 6 or 7, a
+// field that runs past the value, a kid context longer than 32 bytes, a kid
+// longer than 7 bytes and bytes after the Partial IV and the kid context when
+// the `kid` flag is clear.
+//
+// ```novo
+// use oscopt
+//
+// fn main() [io]
+//     // RFC 8613 section 6.3 example 3: flags 0x19, Partial IV 05, kid context
+//     // 44616c656b (5 bytes), no kid bytes after it (the kid is empty).
+//     var m: Vec[u8; 1152] = Vec.new()
+//     for b in [0x19, 0x05, 0x05, 0x44, 0x61, 0x6c, 0x65, 0x6b]
+//         let _p = m.push(b as u8)
+//     let o = oscopt.decode(var m, 0, 8)
+//     println("${o.ok} ${o.piv} ${o.has_kid} ${o.kid_len} ${o.ctx.len()}")   // true 5 true 0 5
+// ```
+pub @tier(embedded)
+@no_alloc
+fn decode(var m: OscMsg, off: Int, len: Int) -> OscOption []
+    if len == 0
+        return OscOption { ok: true, piv: 0, piv_len: 0, has_kid: false, kid: 0, kid_len: 0, has_ctx: false,
+                           ctx: Vec.new() }
+    if off < 0 or off + len > m.len()
+        return bad_option()
+    let flags = m[off] as Int
+    let n = flags & 7
+    let has_kid = (flags & 8) != 0
+    let has_ctx = (flags & 16) != 0
+    if (flags & 0xE0) != 0 or n > 5
+        return bad_option()
+    let end = off + len
+    var pos = off + 1
+    if pos + n > end
+        return bad_option()
+    var piv = 0
+    for i in 0..n
+        piv = (piv << 8) | m[pos + i] as Int
+    pos = pos + n
+    var ctx: IdContext = Vec.new()
+    if has_ctx
+        if pos >= end
+            return bad_option()
+        let s = m[pos] as Int
+        pos = pos + 1
+        if s > oscctx.OSC_IDCTX_MAX or pos + s > end
+            return bad_option()
+        for i in 0..s
+            let _c = ctx.push(m[pos + i])
+        pos = pos + s
+    var kid = 0
+    let kid_len = end - pos
+    if has_kid
+        if kid_len > oscctx.OSC_ID_MAX
+            return bad_option()
+        for i in 0..kid_len
+            kid = (kid << 8) | m[pos + i] as Int
+    else if kid_len != 0
+        return bad_option()
+    OscOption { ok: true, piv: piv, piv_len: n, has_kid: has_kid, kid: kid, kid_len: kid_len, has_ctx: has_ctx,
+                ctx: ctx }
+
+// Write an OSCORE option value to `out`, emptied first, and answer its length.
+//
+// `piv_len` is 0 for no Partial IV, otherwise 1 to 5 bytes of `piv` are written.
+// `has_kid` writes `kid` of `kid_len` bytes last.  `has_ctx` writes `ctx` with
+// its length byte.  A value with no flag set is written as nothing at all.
+//
+// ```novo
+// use oscopt
+//
+// fn main() [io]
+//     // RFC 8613 section 6.3 example 1: Partial IV 05 and kid 25.
+//     var out: Vec[u8; 48] = Vec.new()
+//     var none: Vec[u8; 32] = Vec.new()
+//     let n = oscopt.encode(var out, 5, 1, true, 0x25, 1, false, var none)
+//     println("${n} ${out[0]} ${out[1]} ${out[2]}")   // 3 9 5 37
+// ```
+pub @tier(embedded)
+@no_alloc
+fn encode(var out: OptVal, piv: Int, piv_len: Int, has_kid: Bool, kid: Int, kid_len: Int,
+          has_ctx: Bool, var ctx: IdContext) -> Int []
+    out.clear()
+    var flags = piv_len
+    if has_kid
+        flags = flags | 8
+    if has_ctx
+        flags = flags | 16
+    if flags == 0
+        return 0
+    let _f = out.push(flags as u8)
+    for i in 0..piv_len
+        let _p = out.push(((piv >> (8 * (piv_len - 1 - i))) & 0xFF) as u8)
+    if has_ctx
+        let _s = out.push(ctx.len() as u8)
+        for i in 0..ctx.len()
+            let _c = out.push(ctx[i])
+    if has_kid
+        for i in 0..kid_len
+            let _k = out.push(((kid >> (8 * (kid_len - 1 - i))) & 0xFF) as u8)
+    out.len()
+
+// One option read from a message.
+//
+// `ok` is false for an option that is malformed or runs past `end`.  `number`
+// is its number, `voff` and `vlen` its value, and `next` the index of the byte
+// after it.
+pub @value
+struct OptHead
+    ok: Bool
+    number: Int
+    voff: Int
+    vlen: Int
+    next: Int
+
+// The value of a delta or length nibble with its extension bytes, or -1.
+@tier(embedded)
+@no_alloc
+fn ext(var m: OscMsg, nibble: Int, at: Int, end: Int) -> Int
+    if nibble < 13
+        return nibble
+    if nibble == 13
+        if at + 1 > end
+            return -1
+        return m[at] as Int + 13
+    // 14: two bytes follow.  The caller has put 15 aside.
+    if at + 2 > end
+        return -1
+    (m[at] as Int << 8) + m[at + 1] as Int + 269
+
+// The size of the extension of a nibble: 0, 1 or 2.
+@tier(embedded)
+@no_alloc
+fn ext_size(nibble: Int) -> Int
+    if nibble == 13
+        return 1
+    if nibble == 14
+        return 2
+    0
+
+// Read the option that starts at `pos`, `prev` being the number of the option
+// before it (0 for the first).  Stops at `end`.
+//
+// ```novo
+// use oscopt
+//
+// fn main() [io]
+//     // Uri-Host (3) "localhost" and then Uri-Path (11) "tv1": 39 6c6f63616c686f7374 83 747631
+//     var m: Vec[u8; 1152] = Vec.new()
+//     for b in [0x39, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x68, 0x6f, 0x73, 0x74, 0x83, 0x74, 0x76, 0x31]
+//         let _p = m.push(b as u8)
+//     let a = oscopt.read_option(var m, 0, 14, 0)
+//     let b = oscopt.read_option(var m, a.next, 14, a.number)
+//     println("${a.number} ${a.vlen} ${b.number} ${b.vlen}")   // 3 9 11 3
+// ```
+pub @tier(embedded)
+@no_alloc
+fn read_option(var m: OscMsg, pos: Int, end: Int, prev: Int) -> OptHead []
+    let none = OptHead { ok: false, number: 0, voff: 0, vlen: 0, next: pos }
+    if pos >= end or pos < 0 or end > m.len()
+        return none
+    let b = m[pos] as Int
+    let dn = b >> 4
+    let ln = b & 15
+    if dn == 15 or ln == 15
+        return none
+    let delta = ext(var m, dn, pos + 1, end)
+    if delta < 0
+        return none
+    let at = pos + 1 + ext_size(dn)
+    let length = ext(var m, ln, at, end)
+    let voff = at + ext_size(ln)
+    if length < 0 or voff + length > end
+        return none
+    OptHead { ok: true, number: prev + delta, voff: voff, vlen: length, next: voff + length }
+
+// Append the head of an option numbered `number` after one numbered `prev`,
+// with a value of `length` bytes.  False when the message is full or `number`
+// is below `prev`.
+@tier(embedded)
+@no_alloc
+fn put_head(var out: OscMsg, prev: Int, number: Int, length: Int) -> Bool
+    if number < prev or number > 65535
+        return false
+    let delta = number - prev
+    var dn = delta
+    var ln = length
+    if delta >= 269
+        dn = 14
+    else if delta >= 13
+        dn = 13
+    if length >= 269
+        ln = 14
+    else if length >= 13
+        ln = 13
+    // The head is one byte, one or two more for each nibble that is extended.
+    var head = 1
+    if delta >= 269
+        head = head + 2
+    else if delta >= 13
+        head = head + 1
+    if length >= 269
+        head = head + 2
+    else if length >= 13
+        head = head + 1
+    if out.len() + head + length > out.capacity()
+        return false
+    let _a = out.push(((dn << 4) | ln) as u8)
+    if delta >= 269
+        let _b = out.push((((delta - 269) >> 8) & 0xFF) as u8)
+        let _c = out.push(((delta - 269) & 0xFF) as u8)
+    else if delta >= 13
+        let _d = out.push((delta - 13) as u8)
+    if length >= 269
+        let _e = out.push((((length - 269) >> 8) & 0xFF) as u8)
+        let _f = out.push(((length - 269) & 0xFF) as u8)
+    else if length >= 13
+        let _g = out.push((length - 13) as u8)
+    true
+
+// Append an option numbered `number`, after one numbered `prev`, whose value is
+// `len` bytes of `src` from `off`.  False when the message is full or the
+// number is out of order.
+pub @tier(embedded)
+@no_alloc
+fn put_option(var out: OscMsg, prev: Int, number: Int, var src: OscMsg, off: Int,
+              len: Int) -> Bool []
+    if not put_head(var out, prev, number, len)
+        return false
+    for i in 0..len
+        let _p = out.push(src[off + i])
+    true
+
+// Append an option numbered `number` whose value is the bytes of an OSCORE
+// option value buffer.
+pub @tier(embedded)
+@no_alloc
+fn put_option_val(var out: OscMsg, prev: Int, number: Int, var val: OptVal) -> Bool []
+    if not put_head(var out, prev, number, val.len())
+        return false
+    for i in 0..val.len()
+        let _p = out.push(val[i])
+    true
+
+// Append an option numbered `number`, after one numbered `prev`, whose value is
+// the unsigned integer `value` in the fewest bytes, up to 8: zero is no bytes.
+// False when the message is full or the number is out of order.
+pub @tier(embedded)
+@no_alloc
+fn put_uint(var out: OscMsg, prev: Int, number: Int, value: Int) -> Bool []
+    var n = 0
+    for k in 0..8
+        if (value >>> (8 * k)) != 0
+            n = k + 1
+    if not put_head(var out, prev, number, n)
+        return false
+    for i in 0..n
+        let _p = out.push(((value >>> (8 * (n - 1 - i))) & 0xFF) as u8)
+    true

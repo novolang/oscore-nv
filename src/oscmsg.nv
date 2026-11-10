@@ -1,0 +1,714 @@
+// oscmsg.nv — protecting and verifying CoAP requests and responses, RFC 8613
+// sections 4, 5 and 8.
+//
+// OSCORE turns a CoAP message into another CoAP message whose useful part is
+// encrypted.  The original message is split by option class (section 4):
+//
+//   Class E  encrypted and integrity protected: the Code, Uri-Path, Uri-Query,
+//            Content-Format, ETag, If-Match, If-None-Match, Location-Path,
+//            Location-Query, Accept, and, by default, Max-Age, Block1, Block2,
+//            Size1, Size2 and No-Response, and any option this package does not
+//            know; and the payload.  These go into the plaintext.
+//   Class U  unprotected, outer: Uri-Host, Uri-Port, Proxy-Scheme.  These stay
+//            in the options of the protected message, and so do the Type, the
+//            Message ID and the Token.
+//   Observe  both: the value goes into the plaintext, and a copy stays outside
+//            for the proxies (section 4.1.3.5).
+//
+// The plaintext is the Code followed by the Class E options, encoded with deltas
+// from one another, a payload marker and the payload (section 5.3).  The
+// protected message has the Outer Code 0.02 (POST), or 0.05 (FETCH) for a request
+// with Observe, and 2.04 (Changed) or 2.05 (Content, for a notification) for a
+// response; the OSCORE option; and the ciphertext as its payload.
+//
+// WHAT BINDS A RESPONSE TO ITS REQUEST (section 5.4).  The additional data is
+// the Enc_structure of COSE with an external_aad holding the algorithm, the `kid`
+// of the request and the Partial IV of the request.  So a response verifies only
+// as the answer to the request it answers.  `OscoreReq` is what the requester
+// keeps to verify a response and the responder keeps to make one: the `kid`, the
+// Partial IV, the nonce of the request, and, for an observation, how far the
+// notifications have got.
+//
+// A NONCE IS NOT USED TWICE.  The nonce of a request may be reused for one
+// response without a Partial IV of its own, and for no more.  `OscoreReq` counts
+// the use, and a second response that would use it is refused, and so is a
+// notification after the first that does not carry a new Partial IV.
+//
+// WHAT IS NOT DONE.
+// - Proxy-Uri (section 4.1.3.3) is refused with `OSC_E_UNSUPPORTED`: splitting it
+//   into the outer Proxy-Scheme, Uri-Host, Uri-Port and the inner Uri-Path is not
+//   implemented.
+// - Block-wise transfer (section 4.1.3.4) is only the Inner kind.  The Block and
+//   Size options of the original message are Class E and travel inside, so a
+//   message is split into blocks before it is protected and put back together
+//   after it is verified (coap-nv's `coapblock`).  Outer Block options, which a
+//   proxy adds, are not handled: the caller reassembles the outer blocks into one
+//   OSCORE message before `unprotect_*`.
+// - Nested OSCORE: a message that carries an OSCORE option is refused.
+// - Class I options (none are defined) and signaling messages.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.
+
+use coapwire
+use oscctx
+use oscopt
+use oscccm
+
+// Nothing went wrong.
+pub const OSC_OK = 0
+// The message does not parse as a CoAP message, or is not a request (or response)
+// where one was needed.
+pub const OSC_E_PARSE = 1
+// The message to protect already has an OSCORE option.
+pub const OSC_E_NESTED = 2
+// The message has an option this package does not protect: Proxy-Uri.
+pub const OSC_E_UNSUPPORTED = 3
+// The result does not fit a message.
+pub const OSC_E_NOSPACE = 4
+// The Sender Sequence Number has run out.
+pub const OSC_E_SSN = 5
+// The message has no OSCORE option.
+pub const OSC_E_NOT_OSCORE = 6
+// The OSCORE option or the plaintext cannot be read.
+pub const OSC_E_DECODE = 7
+// The `kid` or the `kid context` of a request is not the context's.
+pub const OSC_E_NO_CONTEXT = 8
+// The Partial IV of a request, or of a notification, was seen before.
+pub const OSC_E_REPLAY = 9
+// The tag does not verify.
+pub const OSC_E_DECRYPT = 10
+// A response would use the nonce of the request a second time.
+pub const OSC_E_NONCE_REUSE = 11
+// A response without Observe registration carries an Observe option.
+pub const OSC_E_OBSERVE = 12
+
+// The code of 2.04 Changed, the Outer Code of a response.
+pub const OSC_CODE_CHANGED = 0x44
+// The code of 2.05 Content, the Outer Code of a notification.
+pub const OSC_CODE_CONTENT = 0x45
+// The code of 0.02 POST, the Outer Code of a request.
+pub const OSC_CODE_POST = 0x02
+// The code of 0.05 FETCH, the Outer Code of a request with Observe.
+pub const OSC_CODE_FETCH = 0x05
+
+// What a requester keeps to verify a response and a responder to make one.
+//
+// `kid` and `kid_len` are the Sender ID of the endpoint that sent the request,
+// `piv` and `piv_len` its Partial IV, and `nonce` the nonce of the request.
+// `observe` says the request was an Observe registration.  `nonce_used` says the
+// nonce has been used for a response.  `notif_any` and `notif_num` are the
+// Notification Number of RFC 8613 section 4.1.3.5.2: the highest Partial IV of a
+// notification verified so far, or -1 when only a notification with no Partial IV
+// has been seen.
+pub @value
+struct OscoreReq
+    kid: Int
+    kid_len: Int
+    piv: Int
+    piv_len: Int
+    nonce: OscNonce
+    observe: Bool
+    nonce_used: Bool
+    notif_any: Bool
+    notif_num: Int
+
+// A request record with nothing in it.
+//
+// ```novo
+// use oscmsg
+//
+// fn main() [io]
+//     let r = oscmsg.new_req()
+//     println("${r.observe} ${r.nonce_used}")   // false false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn new_req() -> OscoreReq []
+    OscoreReq { kid: 0, kid_len: 0, piv: 0, piv_len: 1, nonce: Vec.new(), observe: false, nonce_used: false,
+                notif_any: false, notif_num: 0 }
+
+// The CoAP response code a server MAY answer an OSCORE failure with (RFC 8613
+// section 8.2): 4.02 Bad Option for a message that cannot be decoded, 4.01
+// Unauthorized for a context that is not found or a replay, 4.00 Bad Request for
+// a tag that does not verify.  0 for every other status, which has no response.
+// The failure responses are plain CoAP and are not protected, and the server MAY
+// set an Outer Max-Age of 0 on them.
+//
+// ```novo
+// use oscmsg
+//
+// fn main() [io]
+//     println("${oscmsg.error_code(oscmsg.OSC_E_REPLAY)} ${oscmsg.error_code(oscmsg.OSC_OK)}")   // 129 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn error_code(status: Int) -> Int []
+    if status == OSC_E_DECODE
+        0x82
+    else if status == OSC_E_NO_CONTEXT or status == OSC_E_REPLAY
+        0x81
+    else if status == OSC_E_DECRYPT
+        0x80
+    else
+        0
+
+// ── option classes ───────────────────────────────────────────────────
+
+// Whether an option of this number goes into the plaintext when a message is
+// protected: every option but the ones that are Class U alone.
+@tier(embedded)
+@no_alloc
+fn goes_inside(number: Int) -> Bool
+    number != 3 and number != 7 and number != 35 and number != 39
+
+// Whether a copy of an option of this number stays outside when a message is
+// protected: Class U, and Observe.
+@tier(embedded)
+@no_alloc
+fn stays_outside(number: Int) -> Bool
+    number == 3 or number == 6 or number == 7 or number == 35 or number == 39
+
+// Whether an outer option survives into the verified message: the ones that are
+// Class U alone.  Every other outer option is dropped (section 8.2 step 1).
+@tier(embedded)
+@no_alloc
+fn keep_outer(number: Int) -> Bool
+    number == 3 or number == 7 or number == 35 or number == 39
+
+// ── additional data ──────────────────────────────────────────────────
+
+// Append the `n` bytes of `v` as a CBOR byte string.
+@tier(embedded)
+@no_alloc
+fn push_bstr_num(var aad: CcmAad, v: Int, n: Int)
+    let _a = aad.push((0x40 + n) as u8)
+    for i in 0..n
+        let _b = aad.push(((v >> (8 * (n - 1 - i))) & 0xFF) as u8)
+
+// The additional data of RFC 8613 section 5.4, emptied first:
+//
+//   Enc_structure = [ "Encrypt0", h'', external_aad ]
+//   external_aad  = bstr .cbor [ 1, [ 10 ], request_kid, request_piv, h'' ]
+//
+// 83 68 456e63727970743 0 40 followed by the external_aad as a byte string.
+//
+// ```novo
+// use oscmsg
+//
+// fn main() [io]
+//     // RFC 8613 section 5.4: kid 00, Partial IV 25.
+//     var aad: Vec[u8; 128] = Vec.new()
+//     oscmsg.make_aad(var aad, 0, 1, 0x25, 1)
+//     println("${aad.len()} ${aad[11]} ${aad[12]}")   // 21 73 133
+// ```
+pub @tier(embedded)
+@no_alloc
+fn make_aad(var aad: CcmAad, kid: Int, kid_len: Int, piv: Int, piv_len: Int) []
+    aad.clear()
+    let _a = aad.push(0x83)
+    let _b = aad.push(0x68)
+    let _c = aad.push(0x45)
+    let _d = aad.push(0x6E)
+    let _e = aad.push(0x63)
+    let _f = aad.push(0x72)
+    let _g = aad.push(0x79)
+    let _h = aad.push(0x70)
+    let _i = aad.push(0x74)
+    let _j = aad.push(0x30)
+    let _k = aad.push(0x40)
+    // The external_aad, as a byte string of the aad_array.
+    let alen = 4 + 1 + kid_len + 1 + piv_len + 1
+    let _l = aad.push((0x40 + alen) as u8)
+    let _m = aad.push(0x85)
+    let _n = aad.push(0x01)
+    let _o = aad.push(0x81)
+    let _p = aad.push(OSC_ALG_AES_CCM_16_64_128 as u8)
+    push_bstr_num(var aad, kid, kid_len)
+    push_bstr_num(var aad, piv, piv_len)
+    let _q = aad.push(0x40)
+
+// ── the plaintext ────────────────────────────────────────────────────
+
+// How many OSCORE options a parsed message has.
+@tier(embedded)
+@no_alloc
+fn count_oscore(var m: OscMsg, h: CoapHeader) -> Int
+    coapwire.count_options(var m, h, OSC_OPT_OSCORE)
+
+// Build the plaintext: the code, the options that go inside and the payload.
+// `empty_observe` writes the Observe option with no value, as a notification's
+// inner Observe has to be.  False when it does not fit, with 8 bytes kept for
+// the tag.
+@tier(embedded)
+@no_alloc
+fn build_plaintext(var m: OscMsg, h: CoapHeader, var p: OscMsg, empty_observe: Bool) -> Bool
+    p.clear()
+    let _c = p.push(h.code as u8)
+    var prev = 0
+    var it = coapwire.opt_iter(h)
+    for _i in 0..h.len
+        if coapwire.opt_next(var m, var it)
+            if goes_inside(it.number)
+                var len = it.value_len
+                if it.number == 6 and empty_observe
+                    len = 0
+                // The options are some of those of a message that fitted its buffer, so
+                // the plaintext has room for them and no write is refused.
+                let _w = oscopt.put_option(var p, prev, it.number, var m, it.value_off, len)
+                prev = it.number
+    if h.payload_off < h.len
+        if p.len() + 1 + (h.len - h.payload_off) + CCM_TAG > p.capacity()
+            return false
+        let _m = p.push(0xFF)
+        for i in h.payload_off..h.len
+            let _b = p.push(m[i])
+    p.len() + CCM_TAG <= p.capacity()
+
+// The result of reading a plaintext: `ok`, the index where the options end, and
+// the index of the payload (the length when there is none).
+@value
+struct PlainScan
+    ok: Bool
+    opts_end: Int
+    payload: Int
+    observe: Int
+
+// Check the options of a plaintext, which starts at index 1 after the code, and
+// find the payload.  `observe` is the value of the Observe option as an integer
+// (an empty value is 0), or -1 when there is none.  A nested OSCORE option, an
+// option that does not parse, and a payload marker with no payload make `ok`
+// false.
+@tier(embedded)
+@no_alloc
+fn scan_plaintext(var p: OscMsg) -> PlainScan
+    let bad = PlainScan { ok: false, opts_end: 0, payload: 0, observe: -1 }
+    if p.len() < 1
+        return bad
+    var pos = 1
+    var prev = 0
+    var observe = -1
+    for _i in 0..p.len()
+        if pos < p.len() and p[pos] != 0xFF
+            let o = oscopt.read_option(var p, pos, p.len(), prev)
+            if not o.ok or o.number == OSC_OPT_OSCORE
+                return bad
+            if o.number == 6
+                if o.vlen > 3
+                    return bad
+                observe = 0
+                for k in 0..o.vlen
+                    observe = (observe << 8) | p[o.voff + k] as Int
+            prev = o.number
+            pos = o.next
+    if pos < p.len()
+        if pos + 1 >= p.len()
+            return bad
+        return PlainScan { ok: true, opts_end: pos, payload: pos + 1, observe: observe }
+    PlainScan { ok: true, opts_end: pos, payload: pos, observe: observe }
+
+// ── the outer message ────────────────────────────────────────────────
+
+// Write the options that stay outside, those numbered below the OSCORE option
+// (`before` true) or above it, and answer the number of the last.
+//
+// They are some of the options of a message that fitted its buffer, in the same
+// order, so they fit the buffer of the result and no write is refused.
+@tier(embedded)
+@no_alloc
+fn put_outer(var out: OscMsg, var m: OscMsg, h: CoapHeader, prev0: Int, before: Bool) -> Int
+    var prev = prev0
+    var it = coapwire.opt_iter(h)
+    for _i in 0..h.len
+        if coapwire.opt_next(var m, var it)
+            if stays_outside(it.number) and (it.number < OSC_OPT_OSCORE) == before
+                let _w = oscopt.put_option(var out, prev, it.number, var m, it.value_off, it.value_len)
+                prev = it.number
+    prev
+
+// Build the protected message: the header of the original with `outer_code`, the
+// options that stay outside, the OSCORE option, and the ciphertext in `ct` as the
+// payload.  The original header supplies the type, the message ID and the token.
+@tier(embedded)
+@no_alloc
+fn build_outer(var out: OscMsg, var m: OscMsg, h: CoapHeader, outer_code: Int, var val: OptVal,
+               var ct: OscMsg) -> Bool
+    var b = coapwire.builder()
+    let _ok = coapwire.begin(var out, var b, h.kind, outer_code, h.mid, h.token)
+    let prev = put_outer(var out, var m, h, 0, true)
+    if not oscopt.put_option_val(var out, prev, OSC_OPT_OSCORE, var val)
+        return false
+    let _after = put_outer(var out, var m, h, OSC_OPT_OSCORE, false)
+    if out.len() + 1 + ct.len() > out.capacity()
+        return false
+    let _mk = out.push(0xFF)
+    for i in 0..ct.len()
+        let _c = out.push(ct[i])
+    true
+
+// ── the verified message ─────────────────────────────────────────────
+
+// Build the verified message: the header of the protected message with the
+// decrypted code, then the options of the plaintext and the outer options that
+// are Class U alone, in order of their numbers (the outer one first when they are
+// equal), then the payload.  `observe_value` is -1 to copy the plaintext's Observe
+// value and otherwise the value to write in its place.
+//
+// The result is never larger than the protected message it comes from: it has
+// the same header, a subset of its outer options, the options of the plaintext,
+// which with the code and the payload are the ciphertext less its 8-byte tag, and
+// no OSCORE option; and in the merged order each option's delta is no larger than
+// in either list it came from.  The Observe value, up to 3 bytes, replaces an
+// empty one, but the outer copy of the option, which had a value, is gone.  So the
+// writes are never refused and their results are not looked at.
+@tier(embedded)
+@no_alloc
+fn build_inner(var out: OscMsg, var m: OscMsg, h: CoapHeader, var p: OscMsg, sc: PlainScan,
+               observe_value: Int)
+    var b = coapwire.builder()
+    let _begin = coapwire.begin(var out, var b, h.kind, p[0] as Int, h.mid, h.token)
+    var oit = coapwire.opt_iter(h)
+    var have_o = false
+    var onum = 0
+    var ipos = 1
+    var iprev = 0
+    var inum = 0
+    var ihead = oscopt.OptHead { ok: false, number: 0, voff: 0, vlen: 0, next: 1 }
+    var have_i = false
+    var prev = 0
+    for _k in 0..out.capacity()
+        // The next outer option that survives.
+        if not have_o
+            for _j in 0..h.len
+                if not have_o and coapwire.opt_next(var m, var oit)
+                    if keep_outer(oit.number)
+                        have_o = true
+                        onum = oit.number
+        // The next inner option.
+        if not have_i and ipos < sc.opts_end
+            ihead = oscopt.read_option(var p, ipos, sc.opts_end, iprev)
+            have_i = true
+            inum = ihead.number
+            iprev = inum
+            ipos = ihead.next
+        if have_o and (not have_i or onum <= inum)
+            let _o = oscopt.put_option(var out, prev, onum, var m, oit.value_off, oit.value_len)
+            prev = onum
+            have_o = false
+        else if have_i
+            if inum == 6 and observe_value >= 0
+                let _v = oscopt.put_uint(var out, prev, 6, observe_value)
+            else
+                let _i = oscopt.put_option(var out, prev, inum, var p, ihead.voff, ihead.vlen)
+            prev = inum
+            have_i = false
+    if sc.payload < p.len()
+        let _mk = out.push(0xFF)
+        for i in sc.payload..p.len()
+            let _c = out.push(p[i])
+
+// ── requests ─────────────────────────────────────────────────────────
+
+// Whether a message is, to this package, a request: a method code.
+@tier(embedded)
+@no_alloc
+fn refuse_original(var m: OscMsg, h: CoapHeader) -> Int
+    if h.status != coapwire.COAP_PARSE_OK
+        return OSC_E_PARSE
+    if count_oscore(var m, h) > 0
+        return OSC_E_NESTED
+    if coapwire.has_option(var m, h, 35)
+        return OSC_E_UNSUPPORTED
+    OSC_OK
+
+// Protect a CoAP request (RFC 8613 section 8.1).
+//
+// `req` is the request as the application made it, `c` the context, `out` the
+// protected request, emptied first, and `rs` the record the requester keeps to
+// verify the response.  The Sender Sequence Number is taken and advances, so a
+// request that fails after that point has used a number; the nonce is never
+// reused.
+//
+// Answers `OSC_OK` or `OSC_E_PARSE` for a message that is not a well-formed
+// request, `OSC_E_NESTED` for one with an OSCORE option, `OSC_E_UNSUPPORTED` for
+// one with Proxy-Uri, `OSC_E_SSN` when the numbers have run out, `OSC_E_NOSPACE`
+// when the result does not fit.
+//
+// ```novo
+// use oscctx
+// use oscmsg
+//
+// fn main() [io]
+//     // RFC 8613 appendix C.4: the client of appendix C.1, sequence number 20, protecting
+//     // the GET /tv1 request of the example.
+//     var secret: Vec[u8; 256] = Vec.new()
+//     for i in 1..17
+//         let _a = secret.push(i as u8)
+//     var salt: Vec[u8; 256] = Vec.new()
+//     for b in [0x9e, 0x7c, 0xa9, 0x22, 0x23, 0x78, 0x63, 0x40]
+//         let _b = salt.push(b as u8)
+//     var none: Vec[u8; 256] = Vec.new()
+//     var c = oscctx.new_ctx()
+//     let _r = oscctx.derive(var c, var secret, 16, var salt, 8, 0, 0, 1, 1, var none, -1)
+//     let _s = oscctx.ssn_restore(var c, 10, 5, 5)
+//     var req: Vec[u8; 1152] = Vec.new()
+//     for b in [0x44, 0x01, 0x5d, 0x1f, 0x00, 0x00, 0x39, 0x74, 0x39, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x68, 0x6f,
+//               0x73, 0x74, 0x83, 0x74, 0x76, 0x31]
+//         let _c = req.push(b as u8)
+//     var out: Vec[u8; 1152] = Vec.new()
+//     var rs = oscmsg.new_req()
+//     let st = oscmsg.protect_request(var c, var req, var out, var rs)
+//     println("${st} ${out.len()}")   // 0 35
+// ```
+pub @tier(embedded)
+@no_alloc
+fn protect_request(var c: OscoreCtx, var req: OscMsg, var out: OscMsg, var rs: OscoreReq) -> Int []
+    let h = coapwire.parse(var req)
+    let bad = refuse_original(var req, h)
+    if bad != OSC_OK
+        return bad
+    if not coapwire.is_request(h.code)
+        return OSC_E_PARSE
+    let ssn = oscctx.ssn_next(var c)
+    if ssn < 0
+        return OSC_E_SSN
+    let piv_len = oscctx.piv_len(ssn)
+    var nonce = oscctx.nonce(var c.common_iv, c.sender_id, c.sender_id_len, ssn)
+    var p: OscMsg = Vec.new()
+    if not build_plaintext(var req, h, var p, false)
+        return OSC_E_NOSPACE
+    var aad: CcmAad = Vec.new()
+    make_aad(var aad, c.sender_id, c.sender_id_len, ssn, piv_len)
+    // `build_plaintext` kept 8 bytes for the tag, so the seal is not refused.
+    let _sealed = oscccm.seal(var c.sender_key, var nonce, var aad, var p, 0)
+    var val: OptVal = Vec.new()
+    let _n = oscopt.encode(var val, ssn, piv_len, true, c.sender_id, c.sender_id_len, c.has_id_context, var c.id_context)
+    var outer_code = OSC_CODE_POST
+    if coapwire.has_option(var req, h, 6)
+        outer_code = OSC_CODE_FETCH
+    if not build_outer(var out, var req, h, outer_code, var val, var p)
+        return OSC_E_NOSPACE
+    rs.kid = c.sender_id
+    rs.kid_len = c.sender_id_len
+    rs.piv = ssn
+    rs.piv_len = piv_len
+    rs.nonce = nonce
+    rs.observe = coapwire.find_uint(var req, h, 6) == 0
+    rs.nonce_used = false
+    rs.notif_any = false
+    rs.notif_num = 0
+    OSC_OK
+
+// Find the single OSCORE option of a parsed message.  `ok` is false when there
+// is none or more than one.
+@tier(embedded)
+@no_alloc
+fn find_oscore(var m: OscMsg, h: CoapHeader) -> OptHead
+    var it = coapwire.opt_iter(h)
+    var found = OptHead { ok: false, number: 0, voff: 0, vlen: 0, next: 0 }
+    var count = 0
+    for _i in 0..h.len
+        if coapwire.opt_next(var m, var it)
+            if it.number == OSC_OPT_OSCORE
+                count = count + 1
+                found = OptHead { ok: true,
+                    number: it.number,
+                    voff: it.value_off,
+                    vlen: it.value_len,
+                    next: 0 }
+    if count == 1
+        found
+    else
+        OptHead { ok: false, number: count, voff: 0, vlen: 0, next: 0 }
+
+// Copy the payload of a parsed message into `p`. False when there is none.
+@tier(embedded)
+@no_alloc
+fn take_ciphertext(var m: OscMsg, h: CoapHeader, var p: OscMsg) -> Bool
+    p.clear()
+    if h.payload_off >= h.len
+        return false
+    for i in h.payload_off..h.len
+        let _c = p.push(m[i])
+    true
+
+// Verify a protected request and recover the original (RFC 8613 section 8.2).
+//
+// `c` is the recipient's context.  The `kid` in the OSCORE option has to be the
+// Recipient ID, and the `kid context` the ID Context if the request carries one;
+// finding the right context among several is the caller's, with
+// `oscctx.recipient_matches`.  The Partial IV is looked up in the replay window
+// before anything is decrypted, and recorded in it after the tag verifies.  `out`
+// is the original request, emptied first, with the decrypted code, options and
+// payload and the Class U options of the outer message; `rs` is the record the
+// server keeps to protect the response.
+//
+// Answers `OSC_OK`, `OSC_E_PARSE`, `OSC_E_NOT_OSCORE` for a message with no OSCORE
+// option, `OSC_E_DECODE` for one that has two or whose value or plaintext is
+// malformed or that has no Partial IV, no `kid` or no ciphertext,
+// `OSC_E_NO_CONTEXT`, `OSC_E_REPLAY`, `OSC_E_DECRYPT`, `OSC_E_NESTED` for an inner
+// OSCORE option.  `error_code` gives the response a server
+// may send.
+pub @tier(embedded)
+@no_alloc
+fn unprotect_request(var c: OscoreCtx, var msg: OscMsg, var out: OscMsg,
+                     var rs: OscoreReq) -> Int []
+    let h = coapwire.parse(var msg)
+    if h.status != coapwire.COAP_PARSE_OK or not coapwire.is_request(h.code)
+        return OSC_E_PARSE
+    let oo = find_oscore(var msg, h)
+    if not oo.ok
+        if oo.number == 0
+            return OSC_E_NOT_OSCORE
+        return OSC_E_DECODE
+    var opt = oscopt.decode(var msg, oo.voff, oo.vlen)
+    if not opt.ok or opt.piv_len == 0 or not opt.has_kid
+        return OSC_E_DECODE
+    if not oscctx.recipient_matches(c, opt.kid, opt.kid_len, opt.has_ctx, var opt.ctx)
+        return OSC_E_NO_CONTEXT
+    if not oscctx.replay_ok(c, opt.piv)
+        return OSC_E_REPLAY
+    var p: OscMsg = Vec.new()
+    if not take_ciphertext(var msg, h, var p)
+        return OSC_E_DECODE
+    var nonce = oscctx.nonce(var c.common_iv, c.recipient_id, c.recipient_id_len, opt.piv)
+    var aad: CcmAad = Vec.new()
+    make_aad(var aad, opt.kid, opt.kid_len, opt.piv, opt.piv_len)
+    if not oscccm.open(var c.recipient_key, var nonce, var aad, var p, 0)
+        return OSC_E_DECRYPT
+    oscctx.replay_commit(var c, opt.piv)
+    let sc = scan_plaintext(var p)
+    if not sc.ok
+        return OSC_E_DECODE
+    build_inner(var out, var msg, h, var p, sc, -1)
+    rs.kid = opt.kid
+    rs.kid_len = opt.kid_len
+    rs.piv = opt.piv
+    rs.piv_len = opt.piv_len
+    rs.nonce = nonce
+    rs.observe = sc.observe == 0
+    rs.nonce_used = false
+    rs.notif_any = false
+    rs.notif_num = 0
+    OSC_OK
+
+// ── responses ────────────────────────────────────────────────────────
+
+// Protect a CoAP response (RFC 8613 section 8.3).
+//
+// `rs` is the record of the request it answers.  With `new_piv` false the response
+// uses the nonce of the request and carries no Partial IV, and `rs` marks the
+// nonce used; with `new_piv` true it takes the next Sender Sequence Number and
+// carries it.  A response that has an Observe option is a notification: its inner
+// Observe is written with no value, its Observe option is copied outside, and its
+// Outer Code is 2.05 Content.
+//
+// Answers `OSC_E_NONCE_REUSE` when the request's nonce has been used and `new_piv`
+// is false, which includes every notification after the first, `OSC_E_SSN` when the
+// numbers have run out, and the statuses of `protect_request` for a message that
+// cannot be protected.
+pub @tier(embedded)
+@no_alloc
+fn protect_response(var c: OscoreCtx, var resp: OscMsg, var out: OscMsg, var rs: OscoreReq,
+                    new_piv: Bool) -> Int []
+    let h = coapwire.parse(var resp)
+    let bad = refuse_original(var resp, h)
+    if bad != OSC_OK
+        return bad
+    if not coapwire.is_response(h.code)
+        return OSC_E_PARSE
+    if not new_piv and rs.nonce_used
+        return OSC_E_NONCE_REUSE
+    var nonce = rs.nonce
+    var piv = 0
+    var piv_len = 0
+    if new_piv
+        piv = oscctx.ssn_next(var c)
+        if piv < 0
+            return OSC_E_SSN
+        piv_len = oscctx.piv_len(piv)
+        nonce = oscctx.nonce(var c.common_iv, c.sender_id, c.sender_id_len, piv)
+    let notification = coapwire.has_option(var resp, h, 6)
+    var p: OscMsg = Vec.new()
+    if not build_plaintext(var resp, h, var p, notification)
+        return OSC_E_NOSPACE
+    var aad: CcmAad = Vec.new()
+    make_aad(var aad, rs.kid, rs.kid_len, rs.piv, rs.piv_len)
+    // `build_plaintext` kept 8 bytes for the tag, so the seal is not refused.
+    let _sealed = oscccm.seal(var c.sender_key, var nonce, var aad, var p, 0)
+    var val: OptVal = Vec.new()
+    var no_ctx: IdContext = Vec.new()
+    let _n = oscopt.encode(var val, piv, piv_len, false, 0, 0, false, var no_ctx)
+    var outer_code = OSC_CODE_CHANGED
+    if notification
+        outer_code = OSC_CODE_CONTENT
+    if not build_outer(var out, var resp, h, outer_code, var val, var p)
+        return OSC_E_NOSPACE
+    if not new_piv
+        rs.nonce_used = true
+    OSC_OK
+
+// Verify a protected response and recover the original (RFC 8613 section 8.4).
+//
+// `rs` is the record `protect_request` made.  A response with no Partial IV
+// verifies under the nonce of the request, once; one with a Partial IV under the
+// nonce that Partial IV and the server's ID make.  For an observation, the inner
+// Observe option marks a notification, whose Partial IV has to be above the
+// Notification Number in `rs`, which then moves up to it; the one notification
+// with no Partial IV is the oldest.  The verified message has its Observe value
+// set to the low 24 bits of the Partial IV, as section 4.1.3.5.2 allows, so that
+// an Observe client reads a sequence.
+//
+// Answers `OSC_OK`, `OSC_E_PARSE`, `OSC_E_NOT_OSCORE`, `OSC_E_DECODE`,
+// `OSC_E_NONCE_REUSE` for a second response without a Partial IV, `OSC_E_DECRYPT`,
+// `OSC_E_REPLAY` for a notification that is not newer, `OSC_E_OBSERVE` for an
+// inner Observe option in the answer to a request that was not a registration, and
+// A failure leaves `rs` as it was, and does not end an observation.
+pub @tier(embedded)
+@no_alloc
+fn unprotect_response(var c: OscoreCtx, var msg: OscMsg, var out: OscMsg,
+                      var rs: OscoreReq) -> Int []
+    let h = coapwire.parse(var msg)
+    if h.status != coapwire.COAP_PARSE_OK or not coapwire.is_response(h.code)
+        return OSC_E_PARSE
+    let oo = find_oscore(var msg, h)
+    if not oo.ok
+        if oo.number == 0
+            return OSC_E_NOT_OSCORE
+        return OSC_E_DECODE
+    var opt = oscopt.decode(var msg, oo.voff, oo.vlen)
+    if not opt.ok
+        return OSC_E_DECODE
+    var nonce = rs.nonce
+    if opt.piv_len > 0
+        nonce = oscctx.nonce(var c.common_iv, c.recipient_id, c.recipient_id_len, opt.piv)
+    else if rs.nonce_used
+        return OSC_E_NONCE_REUSE
+    var p: OscMsg = Vec.new()
+    if not take_ciphertext(var msg, h, var p)
+        return OSC_E_DECODE
+    var aad: CcmAad = Vec.new()
+    make_aad(var aad, rs.kid, rs.kid_len, rs.piv, rs.piv_len)
+    if not oscccm.open(var c.recipient_key, var nonce, var aad, var p, 0)
+        return OSC_E_DECRYPT
+    let sc = scan_plaintext(var p)
+    if not sc.ok
+        return OSC_E_DECODE
+    var observe_value = -1
+    var number = rs.notif_num
+    if sc.observe >= 0
+        if not rs.observe
+            return OSC_E_OBSERVE
+        number = -1
+        observe_value = 0
+        if opt.piv_len > 0
+            number = opt.piv
+            observe_value = opt.piv & 0xFFFFFF
+        if rs.notif_any and number <= rs.notif_num
+            return OSC_E_REPLAY
+    build_inner(var out, var msg, h, var p, sc, observe_value)
+    if opt.piv_len == 0
+        rs.nonce_used = true
+    if sc.observe >= 0
+        rs.notif_any = true
+        rs.notif_num = number
+    OSC_OK

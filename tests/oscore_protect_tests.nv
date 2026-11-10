@@ -1,0 +1,625 @@
+// oscore_protect_tests.nv — protecting and verifying requests and responses:
+// Observe, option classes, and every way a message is refused.
+//
+// The contexts are those of RFC 8613 appendix C.1 (master secret 01..10, master
+// salt 9e7ca92223786340): the client has the empty Sender ID and Recipient ID 01,
+// the server the other way round.  The CoAP messages are written out in hex and
+// the derivation of each is in the comment above it: a header is 0x40 + type * 16
+// + token length, a code, a message ID and the token; an option is a delta and a
+// length in one byte, then its value.
+//
+//   41 01 1234 71        CON GET, message ID 0x1234, token 0x71
+//   61 45 1234 71        ACK 2.05 Content, the same ID and token
+//
+// A forged message is made with the context's own key and a nonce built by hand,
+// as a peer holding the key could make it, so that what is wrong with it is the
+// plaintext and not the tag.
+
+use std.test
+use std.bytes
+use std.str
+use oscctx
+use oscccm
+use oscopt
+use oscmsg
+
+fn h(s: Str) -> Bytes
+    bytes.from_hex(s) ?? bytes.zeros(0)
+
+fn load256(s: Str) -> Vec[u8; 256]
+    var m: Vec[u8; 256] = Vec.new()
+    let raw = h(s)
+    for i in 0..bytes.len(raw)
+        let _p = m.push((bytes.byte_at(raw, i) ?? 0) as u8)
+    m
+
+fn msg(s: Str) -> Vec[u8; 1152]
+    var m: Vec[u8; 1152] = Vec.new()
+    let raw = h(s)
+    for i in 0..bytes.len(raw)
+        let _p = m.push((bytes.byte_at(raw, i) ?? 0) as u8)
+    m
+
+fn hx(var m: Vec[u8; 1152]) -> Str
+    var b = bytes.zeros(m.len())
+    for i in 0..m.len()
+        bytes.set_u8(b, i, m[i] as Int)
+    bytes.to_hex(b)
+
+fn derive_with(sid: Int, sid_len: Int, rid: Int, rid_len: Int, ctx_len: Int) -> OscoreCtx
+    var secret = load256("0102030405060708090a0b0c0d0e0f10")
+    var salt = load256("9e7ca92223786340")
+    var idc = load256("37cbf3210017a2d3")
+    var c = oscctx.new_ctx()
+    let _r = oscctx.derive(var c, var secret, 16, var salt, 8, sid, sid_len, rid, rid_len, var idc, ctx_len)
+    c
+
+fn client() -> OscoreCtx
+    derive_with(0, 0, 1, 1, -1)
+
+fn server() -> OscoreCtx
+    derive_with(1, 1, 0, 0, -1)
+
+fn zeros(n: Int) -> Str
+    var s = ""
+    for _i in 0..n
+        s = s + "00"
+    s
+
+// A CON GET with the options and payload given in hex.
+fn get(rest: Str) -> Str
+    "41011234" + "71" + rest
+
+// An ACK 2.05 with the options and payload given in hex.
+fn content(rest: Str) -> Str
+    "61451234" + "71" + rest
+
+// Protect a request with a fresh client and open it with a fresh server.
+fn through(var c: OscoreCtx, var s: OscoreCtx, original: Str) -> Int
+    var req = msg(original)
+    var wire: Vec[u8; 1152] = Vec.new()
+    var crs = oscmsg.new_req()
+    let a = oscmsg.protect_request(var c, var req, var wire, var crs)
+    if a != oscmsg.OSC_OK
+        return a
+    var back: Vec[u8; 1152] = Vec.new()
+    var srs = oscmsg.new_req()
+    let b = oscmsg.unprotect_request(var s, var wire, var back, var srs)
+    if b != oscmsg.OSC_OK
+        return b
+    if hx(var back) == original
+        oscmsg.OSC_OK
+    else
+        -1
+
+// A protected request made by hand: the client's key, the nonce and additional
+// data for Partial IV `piv` (one byte), the plaintext in hex, and the outer header
+// and options given in `outer_head`.
+fn forged_request(var c: OscoreCtx, piv: Int, plain: Str, outer_head: Str) -> Str
+    var nonce = oscctx.nonce(var c.common_iv, c.sender_id, c.sender_id_len, piv)
+    var aad: Vec[u8; 128] = Vec.new()
+    oscmsg.make_aad(var aad, c.sender_id, c.sender_id_len, piv, 1)
+    var p = msg(plain)
+    let _ok = oscccm.seal(var c.sender_key, var nonce, var aad, var p, 0)
+    outer_head + "ff" + hx(var p)
+
+// ── option classes ──────────────────────────────────────────────────
+
+@test
+fn test_a_request_is_split_into_inner_and_outer_options_and_put_back_together() [io]
+    var c = client()
+    var s = server()
+    // Uri-Host (3) "h"; Uri-Port (7) 5683; Uri-Path (11) "a"; Content-Format (12) 60; Max-Age (14) 5; payload "hi".
+    //   31 68 | 42 1633 | b1 61 | 11 3c | 21 05 | ff 6869
+    let original = get("3168" + "421633" + "b161" + "113c" + "2105" + "ff6869")
+    var req = msg(original)
+    var wire: Vec[u8; 1152] = Vec.new()
+    var rs = oscmsg.new_req()
+    test.assert_eq(oscmsg.protect_request(var c, var req, var wire, var rs), oscmsg.OSC_OK)
+    test.case("the outer message: type, ID and token kept, code POST, only Uri-Host and Uri-Port, then OSCORE")
+    test.assert_eq_str(str.slice(hx(var wire), 0, 10), "4102123471")
+    test.assert_eq_str(str.slice(hx(var wire), 10, 28), "3168" + "421633" + "220900" + "ff")
+    var back: Vec[u8; 1152] = Vec.new()
+    var srs = oscmsg.new_req()
+    test.assert_eq(oscmsg.unprotect_request(var s, var wire, var back, var srs), oscmsg.OSC_OK)
+    test.case("the verified message is the original, in order")
+    test.assert_eq_str(hx(var back), original)
+    test.assert_eq(srs.observe, false)
+
+@test
+fn test_an_option_this_package_does_not_know_goes_inside_and_comes_back() [io]
+    var c = client()
+    var s = server()
+    // Uri-Host "h", Uri-Path "a", option 3000 (delta 2989 = 269 + 2720 = 0x0aa0) with value aa.
+    let original = get("3168" + "b161" + "e10aa0aa")
+    test.assert_eq(through(var c, var s, original), oscmsg.OSC_OK)
+    test.case("a request with no payload and no options other than a path")
+    var c2 = client()
+    var s2 = server()
+    test.assert_eq(through(var c2, var s2, get("b161")), oscmsg.OSC_OK)
+    test.case("a request with a payload and no options")
+    var c3 = client()
+    var s3 = server()
+    test.assert_eq(through(var c3, var s3, get("ff0102")), oscmsg.OSC_OK)
+    test.case("nothing but the header")
+    var c4 = client()
+    var s4 = server()
+    test.assert_eq(through(var c4, var s4, get("")), oscmsg.OSC_OK)
+
+@test
+fn test_outer_options_of_class_e_are_dropped_when_a_request_is_verified() [io]
+    var c = client()
+    var s = server()
+    // The request of appendix C.4 with an ETag (4) option, aa, inserted between Uri-Host and the OSCORE
+    // option, as a proxy that was not told otherwise might: 11 aa, and the OSCORE option then follows
+    // with a delta of 5 from 4 instead of 6 from 3: 52 0914.
+    var req = msg("44015d1f00003974" + "396c6f63616c686f7374" + "83747631")
+    test.assert_eq(oscctx.ssn_restore(var c, 10, 5, 5), true)
+    var wire: Vec[u8; 1152] = Vec.new()
+    var rs = oscmsg.new_req()
+    test.assert_eq(oscmsg.protect_request(var c, var req, var wire, var rs), oscmsg.OSC_OK)
+    let w = hx(var wire)
+    let changed = str.slice(w, 0, 36) + "11aa" + "52" + str.slice(w, 38, str.len(w))
+    var tampered = msg(changed)
+    var back: Vec[u8; 1152] = Vec.new()
+    var srs = oscmsg.new_req()
+    test.assert_eq(oscmsg.unprotect_request(var s, var tampered, var back, var srs), oscmsg.OSC_OK)
+    test.assert_eq_str(hx(var back), "44015d1f00003974" + "396c6f63616c686f7374" + "83747631")
+
+@test
+fn test_proxy_uri_and_nested_oscore_are_not_protected() [io]
+    var c = client()
+    var wire: Vec[u8; 1152] = Vec.new()
+    var rs = oscmsg.new_req()
+    test.case("Proxy-Uri (35): delta 35 is 13 + 22: d1 16, one byte")
+    var proxy = msg(get("d11661"))
+    test.assert_eq(oscmsg.protect_request(var c, var proxy, var wire, var rs), oscmsg.OSC_E_UNSUPPORTED)
+    test.case("a message that is already protected")
+    var req = msg(get("b161"))
+    test.assert_eq(oscmsg.protect_request(var c, var req, var wire, var rs), oscmsg.OSC_OK)
+    var again: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscmsg.protect_request(var c, var wire, var again, var rs), oscmsg.OSC_E_NESTED)
+
+// ── the way a request is refused ────────────────────────────────────
+
+@test
+fn test_a_request_that_cannot_be_protected_says_why() [io]
+    var c = client()
+    var out: Vec[u8; 1152] = Vec.new()
+    var rs = oscmsg.new_req()
+    test.case("a message that does not parse")
+    var short = msg("4101")
+    test.assert_eq(oscmsg.protect_request(var c, var short, var out, var rs), oscmsg.OSC_E_PARSE)
+    test.case("a response where a request was needed")
+    var resp = msg(content("ff6869"))
+    test.assert_eq(oscmsg.protect_request(var c, var resp, var out, var rs), oscmsg.OSC_E_PARSE)
+    test.case("a sequence number that has run out")
+    var spent = client()
+    test.assert_eq(oscctx.ssn_restore(var spent, oscctx.OSC_SSN_MAX - 5, 1, 3), true)
+    var ok = 0
+    for _i in 0..2
+        var req = msg(get("b161"))
+        if oscmsg.protect_request(var spent, var req, var out, var rs) == oscmsg.OSC_OK
+            ok = ok + 1
+    test.assert_eq(ok, 2)
+    var last = msg(get("b161"))
+    test.assert_eq(oscmsg.protect_request(var spent, var last, var out, var rs), oscmsg.OSC_E_SSN)
+    test.case("a payload too big for the plaintext and its tag")
+    var big = msg(get("ff") + zeros(1146))
+    test.assert_eq(big.len(), 1152)
+    test.assert_eq(oscmsg.protect_request(var c, var big, var out, var rs), oscmsg.OSC_E_NOSPACE)
+    test.case("a payload that fits as plaintext and not as the protected message")
+    var fat = msg(get("ff") + zeros(1135))
+    test.assert_eq(oscmsg.protect_request(var c, var fat, var out, var rs), oscmsg.OSC_E_NOSPACE)
+    test.case("outer options so long that the OSCORE option does not follow them")
+    var opts = get("") + "3df2" + zeros(255)
+    for _a in 0..3
+        opts = opts + "0df2" + zeros(255)
+    opts = opts + "4c" + zeros(12)
+    for _b in 0..8
+        opts = opts + "0c" + zeros(12)
+    var crowded = msg(opts)
+    test.assert_eq(crowded.len(), 1150)
+    test.assert_eq(oscmsg.protect_request(var c, var crowded, var out, var rs), oscmsg.OSC_E_NOSPACE)
+
+@test
+fn test_a_request_that_cannot_be_verified_says_why() [io]
+    var c = client()
+    var s = server()
+    var out: Vec[u8; 1152] = Vec.new()
+    var srs = oscmsg.new_req()
+    test.case("a message that does not parse, and a response")
+    var short = msg("4101")
+    test.assert_eq(oscmsg.unprotect_request(var s, var short, var out, var srs), oscmsg.OSC_E_PARSE)
+    var resp = msg(content("ff6869"))
+    test.assert_eq(oscmsg.unprotect_request(var s, var resp, var out, var srs), oscmsg.OSC_E_PARSE)
+    test.case("a request with no OSCORE option")
+    var plain = msg(get("b161"))
+    test.assert_eq(oscmsg.unprotect_request(var s, var plain, var out, var srs), oscmsg.OSC_E_NOT_OSCORE)
+    test.case("two OSCORE options: 92 0900, then 02 0901 with a delta of 0")
+    var twice = msg("41021234" + "71" + "920900" + "020901" + "ff" + zeros(12))
+    test.assert_eq(oscmsg.unprotect_request(var s, var twice, var out, var srs), oscmsg.OSC_E_DECODE)
+    test.case("an option value with a reserved bit, with no Partial IV, with no kid")
+    var reserved = msg("41021234" + "71" + "91e0" + "ff" + zeros(12))
+    test.assert_eq(oscmsg.unprotect_request(var s, var reserved, var out, var srs), oscmsg.OSC_E_DECODE)
+    var nopiv = msg("41021234" + "71" + "9108" + "ff" + zeros(12))
+    test.assert_eq(oscmsg.unprotect_request(var s, var nopiv, var out, var srs), oscmsg.OSC_E_DECODE)
+    var nokid = msg("41021234" + "71" + "9101" + "ff" + zeros(12))
+    test.assert_eq(oscmsg.unprotect_request(var s, var nokid, var out, var srs), oscmsg.OSC_E_DECODE)
+    test.case("a request that names another sender")
+    var other = msg("41021234" + "71" + "93090005" + "ff" + zeros(12))
+    test.assert_eq(oscmsg.unprotect_request(var s, var other, var out, var srs), oscmsg.OSC_E_NO_CONTEXT)
+    test.case("a request that names an ID Context the server's context does not have")
+    var named = msg("41021234" + "71" + "94190001aa" + "ff" + zeros(12))
+    test.assert_eq(oscmsg.unprotect_request(var s, var named, var out, var srs), oscmsg.OSC_E_NO_CONTEXT)
+    test.case("a request with no payload")
+    var empty = msg("41021234" + "71" + "920900")
+    test.assert_eq(oscmsg.unprotect_request(var s, var empty, var out, var srs), oscmsg.OSC_E_DECODE)
+    test.case("a ciphertext with a byte changed")
+    var req = msg(get("b161"))
+    var wire: Vec[u8; 1152] = Vec.new()
+    var crs = oscmsg.new_req()
+    test.assert_eq(oscmsg.protect_request(var c, var req, var wire, var crs), oscmsg.OSC_OK)
+    let w = hx(var wire)
+    let n = str.len(w)
+    var flipped = msg(str.slice(w, 0, n - 2) + "00")
+    test.assert_eq(oscmsg.unprotect_request(var s, var flipped, var out, var srs), oscmsg.OSC_E_DECRYPT)
+    test.assert_eq(s.win_any, false)
+    test.case("the genuine one is still accepted, and the second time is a replay")
+    test.assert_eq(oscmsg.unprotect_request(var s, var wire, var out, var srs), oscmsg.OSC_OK)
+    test.assert_eq(oscmsg.unprotect_request(var s, var wire, var out, var srs), oscmsg.OSC_E_REPLAY)
+
+@test
+fn test_a_plaintext_that_is_malformed_is_refused_after_the_tag_verifies() [io]
+    var c = client()
+    var s = server()
+    var out: Vec[u8; 1152] = Vec.new()
+    var srs = oscmsg.new_req()
+    let head = "41021234" + "71" + "920900"
+    test.case("an empty plaintext has no code")
+    var a = msg(forged_request(var c, 0, "", head))
+    test.assert_eq(oscmsg.unprotect_request(var s, var a, var out, var srs), oscmsg.OSC_E_DECODE)
+    test.case("an option with a delta nibble of 15")
+    var b = msg(forged_request(var c, 1, "01f1aa", "41021234" + "71" + "920901"))
+    test.assert_eq(oscmsg.unprotect_request(var s, var b, var out, var srs), oscmsg.OSC_E_DECODE)
+    test.case("an OSCORE option inside")
+    var d = msg(forged_request(var c, 2, "01910" + "9aa", "41021234" + "71" + "920902"))
+    test.assert_eq(oscmsg.unprotect_request(var s, var d, var out, var srs), oscmsg.OSC_E_DECODE)
+    test.case("a payload marker with no payload")
+    var e = msg(forged_request(var c, 3, "01ff", "41021234" + "71" + "920903"))
+    test.assert_eq(oscmsg.unprotect_request(var s, var e, var out, var srs), oscmsg.OSC_E_DECODE)
+    test.case("an Observe value of four bytes")
+    var f = msg(forged_request(var c, 4, "0164" + "01020304", "41021234" + "71" + "920904"))
+    test.assert_eq(oscmsg.unprotect_request(var s, var f, var out, var srs), oscmsg.OSC_E_DECODE)
+    test.case("a well-formed plaintext of the same kind is accepted: code 01, Uri-Path a, payload 2a")
+    var g = msg(forged_request(var c, 5, "01b161ff2a", "41021234" + "71" + "920905"))
+    test.assert_eq(oscmsg.unprotect_request(var s, var g, var out, var srs), oscmsg.OSC_OK)
+    test.assert_eq_str(hx(var out), "41011234" + "71" + "b161" + "ff2a")
+
+@test
+fn test_the_error_responses_a_server_may_send() [io]
+    test.assert_eq(oscmsg.error_code(oscmsg.OSC_E_DECODE), 0x82)
+    test.assert_eq(oscmsg.error_code(oscmsg.OSC_E_NO_CONTEXT), 0x81)
+    test.assert_eq(oscmsg.error_code(oscmsg.OSC_E_REPLAY), 0x81)
+    test.assert_eq(oscmsg.error_code(oscmsg.OSC_E_DECRYPT), 0x80)
+    test.assert_eq(oscmsg.error_code(oscmsg.OSC_OK), 0)
+    test.assert_eq(oscmsg.error_code(oscmsg.OSC_E_NOT_OSCORE), 0)
+
+// ── responses ───────────────────────────────────────────────────────
+
+// A request through to the server, leaving both records.
+fn exchange(var c: OscoreCtx, var s: OscoreCtx, original: Str, var crs: OscoreReq,
+            var srs: OscoreReq)
+    var req = msg(original)
+    var wire: Vec[u8; 1152] = Vec.new()
+    let _a = oscmsg.protect_request(var c, var req, var wire, var crs)
+    var back: Vec[u8; 1152] = Vec.new()
+    let _b = oscmsg.unprotect_request(var s, var wire, var back, var srs)
+
+@test
+fn test_a_response_uses_the_nonce_of_its_request_once() [io]
+    var c = client()
+    var s = server()
+    var crs = oscmsg.new_req()
+    var srs = oscmsg.new_req()
+    exchange(var c, var s, get("b161"), var crs, var srs)
+    var resp = msg(content("ff6869"))
+    var wire: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscmsg.protect_response(var s, var resp, var wire, var srs, false), oscmsg.OSC_OK)
+    test.case("61 44 1234 71, the OSCORE option empty (90), then the payload")
+    test.assert_eq_str(str.slice(hx(var wire), 0, 14), "61441234" + "71" + "90" + "ff")
+    test.case("a second response with the request's nonce is refused")
+    var again: Vec[u8; 1152] = Vec.new()
+    var resp2 = msg(content("ff6869"))
+    test.assert_eq(oscmsg.protect_response(var s, var resp2, var again, var srs, false), oscmsg.OSC_E_NONCE_REUSE)
+    test.case("the client verifies the first, and not a second copy of it")
+    var back: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscmsg.unprotect_response(var c, var wire, var back, var crs), oscmsg.OSC_OK)
+    test.assert_eq_str(hx(var back), content("ff6869"))
+    test.assert_eq(crs.nonce_used, true)
+    var copy: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscmsg.unprotect_response(var c, var wire, var copy, var crs), oscmsg.OSC_E_NONCE_REUSE)
+    test.case("a response with its own Partial IV is not limited that way")
+    var resp3 = msg(content("ff6869"))
+    var third: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscmsg.protect_response(var s, var resp3, var third, var srs, true), oscmsg.OSC_OK)
+    var back3: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscmsg.unprotect_response(var c, var third, var back3, var crs), oscmsg.OSC_OK)
+    test.assert_eq_str(hx(var back3), content("ff6869"))
+
+@test
+fn test_a_response_that_cannot_be_protected_says_why() [io]
+    var c = client()
+    var s = server()
+    var crs = oscmsg.new_req()
+    var srs = oscmsg.new_req()
+    exchange(var c, var s, get("b161"), var crs, var srs)
+    var out: Vec[u8; 1152] = Vec.new()
+    test.case("a message that does not parse, and a request")
+    var short = msg("6145")
+    test.assert_eq(oscmsg.protect_response(var s, var short, var out, var srs, false), oscmsg.OSC_E_PARSE)
+    var request = msg(get("b161"))
+    test.assert_eq(oscmsg.protect_response(var s, var request, var out, var srs, false), oscmsg.OSC_E_PARSE)
+    test.case("a response that is already protected")
+    var resp = msg(content("ff6869"))
+    var wire: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscmsg.protect_response(var s, var resp, var wire, var srs, false), oscmsg.OSC_OK)
+    test.assert_eq(oscmsg.protect_response(var s, var wire, var out, var srs, true), oscmsg.OSC_E_NESTED)
+    test.case("a sequence number that has run out")
+    var spent = server()
+    test.assert_eq(oscctx.ssn_restore(var spent, oscctx.OSC_SSN_MAX - 3, 1, 1), true)
+    var first = msg(content("ff6869"))
+    test.assert_eq(oscmsg.protect_response(var spent, var first, var out, var srs, true), oscmsg.OSC_OK)
+    var second = msg(content("ff6869"))
+    test.assert_eq(oscmsg.protect_response(var spent, var second, var out, var srs, true), oscmsg.OSC_OK)
+    var again = msg(content("ff6869"))
+    test.assert_eq(oscmsg.protect_response(var spent, var again, var out, var srs, true), oscmsg.OSC_E_SSN)
+    test.case("a payload too big for the plaintext and its tag")
+    var big = msg(content("ff") + zeros(1146))
+    test.assert_eq(oscmsg.protect_response(var s, var big, var out, var srs, true), oscmsg.OSC_E_NOSPACE)
+    test.case("a payload that fits as plaintext and not as the protected message")
+    var fat = msg(content("ff") + zeros(1135))
+    test.assert_eq(oscmsg.protect_response(var s, var fat, var out, var srs, true), oscmsg.OSC_E_NOSPACE)
+
+@test
+fn test_a_response_that_cannot_be_verified_says_why() [io]
+    var c = client()
+    var s = server()
+    var crs = oscmsg.new_req()
+    var srs = oscmsg.new_req()
+    exchange(var c, var s, get("b161"), var crs, var srs)
+    var out: Vec[u8; 1152] = Vec.new()
+    test.case("a message that does not parse, and a request")
+    var short = msg("6145")
+    test.assert_eq(oscmsg.unprotect_response(var c, var short, var out, var crs), oscmsg.OSC_E_PARSE)
+    var request = msg(get("b161"))
+    test.assert_eq(oscmsg.unprotect_response(var c, var request, var out, var crs), oscmsg.OSC_E_PARSE)
+    test.case("a response with no OSCORE option")
+    var plain = msg(content("ff6869"))
+    test.assert_eq(oscmsg.unprotect_response(var c, var plain, var out, var crs), oscmsg.OSC_E_NOT_OSCORE)
+    test.case("two OSCORE options")
+    var twice = msg("61441234" + "71" + "900" + "0" + "000" + "0" + "ff" + zeros(12))
+    test.assert_eq(oscmsg.unprotect_response(var c, var twice, var out, var crs), oscmsg.OSC_E_DECODE)
+    test.case("an option value that is malformed")
+    var reserved = msg("61441234" + "71" + "91e0" + "ff" + zeros(12))
+    test.assert_eq(oscmsg.unprotect_response(var c, var reserved, var out, var crs), oscmsg.OSC_E_DECODE)
+    test.case("a response with no payload")
+    var empty = msg("61441234" + "71" + "90")
+    test.assert_eq(oscmsg.unprotect_response(var c, var empty, var out, var crs), oscmsg.OSC_E_DECODE)
+    test.case("a ciphertext with a byte changed, and the request's nonce not spent by it")
+    var resp = msg(content("ff6869"))
+    var wire: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscmsg.protect_response(var s, var resp, var wire, var srs, false), oscmsg.OSC_OK)
+    let w = hx(var wire)
+    var flipped = msg(str.slice(w, 0, str.len(w) - 2) + "00")
+    test.assert_eq(oscmsg.unprotect_response(var c, var flipped, var out, var crs), oscmsg.OSC_E_DECRYPT)
+    test.assert_eq(crs.nonce_used, false)
+    test.case("the genuine one is still accepted")
+    test.assert_eq(oscmsg.unprotect_response(var c, var wire, var out, var crs), oscmsg.OSC_OK)
+
+@test
+fn test_a_response_is_bound_to_the_request_it_answers() [io]
+    var c = client()
+    var s = server()
+    var crs1 = oscmsg.new_req()
+    var srs1 = oscmsg.new_req()
+    exchange(var c, var s, get("b161"), var crs1, var srs1)
+    var crs2 = oscmsg.new_req()
+    var srs2 = oscmsg.new_req()
+    exchange(var c, var s, get("b162"), var crs2, var srs2)
+    var resp = msg(content("ff6869"))
+    var wire: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscmsg.protect_response(var s, var resp, var wire, var srs1, true), oscmsg.OSC_OK)
+    var out: Vec[u8; 1152] = Vec.new()
+    test.case("verified against the other request, the additional data differs and the tag fails")
+    test.assert_eq(oscmsg.unprotect_response(var c, var wire, var out, var crs2), oscmsg.OSC_E_DECRYPT)
+    test.assert_eq(oscmsg.unprotect_response(var c, var wire, var out, var crs1), oscmsg.OSC_OK)
+
+// ── Observe ─────────────────────────────────────────────────────────
+
+@test
+fn test_an_observe_registration_is_fetch_outside_and_observe_zero_inside() [io]
+    var c = client()
+    var s = server()
+    // Observe (6) with no value, Uri-Path (11) "a": 60, 51 61.
+    let original = get("60" + "5161")
+    var req = msg(original)
+    var wire: Vec[u8; 1152] = Vec.new()
+    var crs = oscmsg.new_req()
+    test.assert_eq(oscmsg.protect_request(var c, var req, var wire, var crs), oscmsg.OSC_OK)
+    test.case("code FETCH, the Observe option copied outside, then OSCORE with a delta of 3")
+    test.assert_eq_str(str.slice(hx(var wire), 0, 10), "4105123471")
+    test.assert_eq_str(str.slice(hx(var wire), 10, 20), "60" + "320900" + "ff")
+    test.assert_eq(crs.observe, true)
+    var back: Vec[u8; 1152] = Vec.new()
+    var srs = oscmsg.new_req()
+    test.assert_eq(oscmsg.unprotect_request(var s, var wire, var back, var srs), oscmsg.OSC_OK)
+    test.case("the inner Observe is what is used, the outer one is dropped, and the server knows it is a registration")
+    test.assert_eq_str(hx(var back), original)
+    test.assert_eq(srs.observe, true)
+    test.case("a cancellation (Observe 1) is not a registration")
+    var c2 = client()
+    var s2 = server()
+    var cancel = msg(get("6101" + "5161"))
+    var wire2: Vec[u8; 1152] = Vec.new()
+    var crs2 = oscmsg.new_req()
+    test.assert_eq(oscmsg.protect_request(var c2, var cancel, var wire2, var crs2), oscmsg.OSC_OK)
+    test.assert_eq(crs2.observe, false)
+    var back2: Vec[u8; 1152] = Vec.new()
+    var srs2 = oscmsg.new_req()
+    test.assert_eq(oscmsg.unprotect_request(var s2, var wire2, var back2, var srs2), oscmsg.OSC_OK)
+    test.assert_eq(srs2.observe, false)
+
+@test
+fn test_notifications_carry_a_partial_iv_after_the_first_and_are_ordered_by_it() [io]
+    var c = client()
+    var s = server()
+    var crs = oscmsg.new_req()
+    var srs = oscmsg.new_req()
+    exchange(var c, var s, get("60" + "5161"), var crs, var srs)
+    test.assert_eq(srs.observe, true)
+    // A notification: ACK 2.05, Observe (6) 0x0001 as a value of two bytes (62 0001), payload "21".
+    let note = content("62" + "0001" + "ff21")
+    var out: Vec[u8; 1152] = Vec.new()
+    var back: Vec[u8; 1152] = Vec.new()
+    test.case("the first notification may use the request's nonce: no Partial IV, Outer Code 2.05, Observe copied")
+    var n1 = msg(note)
+    test.assert_eq(oscmsg.protect_response(var s, var n1, var out, var srs, false), oscmsg.OSC_OK)
+    test.assert_eq_str(str.slice(hx(var out), 0, 20), "61451234" + "71" + "620001" + "30" + "ff")
+    var first: Vec[u8; 1152] = Vec.new()
+    for i in 0..out.len()
+        let _p = first.push(out[i])
+    test.assert_eq(oscmsg.unprotect_response(var c, var out, var back, var crs), oscmsg.OSC_OK)
+    test.case("the verified notification has Observe 0 (no Partial IV: the oldest) and the payload")
+    test.assert_eq_str(hx(var back), content("60" + "ff21"))
+    test.case("a second notification on the request's nonce is refused by the server, and by the client")
+    var n2 = msg(note)
+    var refused: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscmsg.protect_response(var s, var n2, var refused, var srs, false), oscmsg.OSC_E_NONCE_REUSE)
+    var replayed: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscmsg.unprotect_response(var c, var first, var replayed, var crs), oscmsg.OSC_E_NONCE_REUSE)
+    test.case("a notification with a new Partial IV 0: Observe value is its low 24 bits, which is nothing")
+    var n3 = msg(note)
+    var out3: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscmsg.protect_response(var s, var n3, var out3, var srs, true), oscmsg.OSC_OK)
+    var wire3: Vec[u8; 1152] = Vec.new()
+    for i in 0..out3.len()
+        let _q = wire3.push(out3[i])
+    var back3: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscmsg.unprotect_response(var c, var out3, var back3, var crs), oscmsg.OSC_OK)
+    test.assert_eq_str(hx(var back3), content("60" + "ff21"))
+    test.case("and one with Partial IV 1: Observe 1")
+    var n4 = msg(note)
+    var out4: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscmsg.protect_response(var s, var n4, var out4, var srs, true), oscmsg.OSC_OK)
+    var back4: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscmsg.unprotect_response(var c, var out4, var back4, var crs), oscmsg.OSC_OK)
+    test.assert_eq_str(hx(var back4), content("6101" + "ff21"))
+    test.assert_eq(crs.notif_num, 1)
+    test.case("an older notification is a replay, and so is the same one again")
+    var stale: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscmsg.unprotect_response(var c, var wire3, var stale, var crs), oscmsg.OSC_E_REPLAY)
+    var same: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscmsg.unprotect_response(var c, var out4, var same, var crs), oscmsg.OSC_E_REPLAY)
+    test.assert_eq(crs.notif_num, 1)
+
+@test
+fn test_a_notification_to_a_request_that_was_not_a_registration_is_refused() [io]
+    var c = client()
+    var s = server()
+    var crs = oscmsg.new_req()
+    var srs = oscmsg.new_req()
+    exchange(var c, var s, get("5161"), var crs, var srs)
+    test.assert_eq(crs.observe, false)
+    var note = msg(content("62" + "0001" + "ff21"))
+    var out: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscmsg.protect_response(var s, var note, var out, var srs, true), oscmsg.OSC_OK)
+    var back: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscmsg.unprotect_response(var c, var out, var back, var crs), oscmsg.OSC_E_OBSERVE)
+    test.case("the Observe state was not touched")
+    test.assert_eq(crs.notif_any, false)
+
+// A protected response made by hand with the server's key, under the nonce and the
+// additional data of the request recorded in `srs`.
+fn forged_response(var s: OscoreCtx, var srs: OscoreReq, plain: Str) -> Str
+    var aad: Vec[u8; 128] = Vec.new()
+    oscmsg.make_aad(var aad, srs.kid, srs.kid_len, srs.piv, srs.piv_len)
+    var p = msg(plain)
+    let _ok = oscccm.seal(var s.sender_key, var srs.nonce, var aad, var p, 0)
+    "61441234" + "71" + "90" + "ff" + hx(var p)
+
+@test
+fn test_a_response_whose_plaintext_is_malformed_is_refused_after_the_tag_verifies() [io]
+    var c = client()
+    var s = server()
+    var crs = oscmsg.new_req()
+    var srs = oscmsg.new_req()
+    exchange(var c, var s, get("b161"), var crs, var srs)
+    var out: Vec[u8; 1152] = Vec.new()
+    test.case("an option with a delta nibble of 15")
+    var bad = msg(forged_response(var s, var srs, "45f1aa"))
+    test.assert_eq(oscmsg.unprotect_response(var c, var bad, var out, var crs), oscmsg.OSC_E_DECODE)
+    test.assert_eq(crs.nonce_used, false)
+    test.case("a well-formed one under the same nonce is accepted")
+    var good = msg(forged_response(var s, var srs, "45ff2a"))
+    test.assert_eq(oscmsg.unprotect_response(var c, var good, var out, var crs), oscmsg.OSC_OK)
+    test.assert_eq_str(hx(var out), "61451234" + "71" + "ff2a")
+
+@test
+fn test_inner_options_that_leave_no_room_for_the_tag_are_refused() [io]
+    var c = client()
+    var out: Vec[u8; 1152] = Vec.new()
+    var rs = oscmsg.new_req()
+    // If-Match (1) options, 1145 bytes in all, and no payload: the plaintext is 1146 bytes and the
+    // tag does not fit.
+    var opts = get("1df2") + zeros(255)
+    for _a in 0..3
+        opts = opts + "0df2" + zeros(255)
+    for _b in 0..9
+        opts = opts + "0c" + zeros(12)
+    var crowded = msg(opts)
+    test.assert_eq(crowded.len(), 1150)
+    test.assert_eq(oscmsg.protect_request(var c, var crowded, var out, var rs), oscmsg.OSC_E_NOSPACE)
+
+// A protected response made by hand under the nonce of the request recorded in
+// `srs`, with a `kid` of the caller's choosing in the additional data.
+fn forged_response_for(var s: OscoreCtx, var srs: OscoreReq, kid: Int, plain: Str) -> Str
+    var aad: Vec[u8; 128] = Vec.new()
+    oscmsg.make_aad(var aad, kid, srs.kid_len, srs.piv, srs.piv_len)
+    var p = msg(plain)
+    let _ok = oscccm.seal(var s.sender_key, var srs.nonce, var aad, var p, 0)
+    "61441234" + "71" + "90" + "ff" + hx(var p)
+
+@test
+fn test_the_kid_of_the_request_is_part_of_what_a_response_is_bound_to() [io]
+    // Sender ID 42 for the client, 24 for the server: neither is empty or zero, so a
+    // response that leaves the kid out of its additional data cannot pass for one that has it.
+    var c = derive_with(0x42, 1, 0x24, 1, -1)
+    var s = derive_with(0x24, 1, 0x42, 1, -1)
+    var crs = oscmsg.new_req()
+    var srs = oscmsg.new_req()
+    exchange(var c, var s, get("b161"), var crs, var srs)
+    test.assert_eq(srs.kid, 0x42)
+    test.assert_eq(crs.kid, 0x42)
+    var out: Vec[u8; 1152] = Vec.new()
+    test.case("the response protected by the package verifies")
+    var resp = msg(content("ff6869"))
+    var wire: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscmsg.protect_response(var s, var resp, var wire, var srs, false), oscmsg.OSC_OK)
+    test.assert_eq(oscmsg.unprotect_response(var c, var wire, var out, var crs), oscmsg.OSC_OK)
+    test.case("a response made with the request's kid in its additional data verifies")
+    var c2 = derive_with(0x42, 1, 0x24, 1, -1)
+    var s2 = derive_with(0x24, 1, 0x42, 1, -1)
+    var crs2 = oscmsg.new_req()
+    var srs2 = oscmsg.new_req()
+    exchange(var c2, var s2, get("b161"), var crs2, var srs2)
+    var right = msg(forged_response_for(var s2, var srs2, 0x42, "45ff2a"))
+    test.assert_eq(oscmsg.unprotect_response(var c2, var right, var out, var crs2), oscmsg.OSC_OK)
+    test.case("one made with another kid does not")
+    var c3 = derive_with(0x42, 1, 0x24, 1, -1)
+    var s3 = derive_with(0x24, 1, 0x42, 1, -1)
+    var crs3 = oscmsg.new_req()
+    var srs3 = oscmsg.new_req()
+    exchange(var c3, var s3, get("b161"), var crs3, var srs3)
+    var wrong = msg(forged_response_for(var s3, var srs3, 0x43, "45ff2a"))
+    test.assert_eq(oscmsg.unprotect_response(var c3, var wrong, var out, var crs3), oscmsg.OSC_E_DECRYPT)

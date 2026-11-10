@@ -1,0 +1,206 @@
+// osckdf.nv — SHA-256, HMAC-SHA-256 and the HKDF of RFC 5869, with no heap.
+//
+// OSCORE derives its keys and its Common IV from a master secret with HKDF
+// (RFC 8613 section 3.2.1), and the default HKDF is HKDF-SHA-256.  On a
+// device that holds a master secret in flash and has no allocator, the
+// derivation has to run in buffers of fixed size, so it is here, over the
+// compression function of crypto-nv's `sha256_core`, which already builds for
+// a Cortex-M.
+//
+// A buffer is a `Vec[u8; OSC_KDF_MAX]`, 256 bytes, owned by the caller; a
+// length is passed beside it, and the bytes past the length are not read.
+// A digest is a `Vec[u8; 32]`.  A key longer than the 64-byte block of
+// SHA-256 is hashed first, as RFC 2104 section 2 says, so a key of up to 256
+// bytes works; the message under a key is limited by the room beside the
+// 64-byte pad: 192 bytes.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.
+
+use word
+use sha256_core
+
+// The capacity of a buffer in this module, in bytes.
+pub const OSC_KDF_MAX = 256
+// The size of a SHA-256 digest, in bytes.
+pub const OSC_DIGEST = 32
+
+// A buffer of bytes with a length kept beside it.
+pub alias KdfBuf = Vec[u8; 256]
+// A SHA-256 digest.
+pub alias Digest = Vec[u8; 32]
+
+// The big-endian word at `at` of a buffer.  Every block read is inside the
+// buffer or inside the padded tail, so no read goes past the end.
+@tier(embedded)
+@no_alloc
+fn word_at(var m: KdfBuf, at: Int) -> Int
+    var v = 0
+    for i in 0..4
+        v = (v << 8) | m[at + i] as Int
+    v
+
+// The 64-byte block that starts at `at`.
+@tier(embedded)
+@no_alloc
+fn block_at(var m: KdfBuf, at: Int) -> Block
+    Block { w: [word_at(var m, at), word_at(var m, at + 4), word_at(var m, at + 8), word_at(var m, at + 12),
+                word_at(var m, at + 16), word_at(var m, at + 20), word_at(var m, at + 24), word_at(var m, at + 28),
+                word_at(var m, at + 32), word_at(var m, at + 36), word_at(var m, at + 40), word_at(var m, at + 44),
+                word_at(var m, at + 48), word_at(var m, at + 52), word_at(var m, at + 56), word_at(var m, at + 60)] }
+
+// Append the four bytes of a state word, most significant first.
+@tier(embedded)
+@no_alloc
+fn push_word(var out: Digest, w: Int)
+    let _a = out.push(((w >> 24) & 0xFF) as u8)
+    let _b = out.push(((w >> 16) & 0xFF) as u8)
+    let _c = out.push(((w >> 8) & 0xFF) as u8)
+    let _d = out.push((w & 0xFF) as u8)
+
+// The SHA-256 of the first `n` bytes of `m`, written to `out`, emptied first.
+//
+// FIPS 180-4 section 5.1.1: the message, a byte 0x80, zeros up to 56 bytes
+// into a block, and the length in bits as 8 bytes.  `n` is cut to the bytes
+// the buffer holds.
+//
+// ```novo
+// use osckdf
+//
+// fn main() [io]
+//     var m: Vec[u8; 256] = Vec.new()
+//     for b in [0x61, 0x62, 0x63]
+//         let _p = m.push(b as u8)
+//     var d: Vec[u8; 32] = Vec.new()
+//     osckdf.sha256(var m, 3, var d)
+//     println("${d[0]} ${d[1]} ${d[31]}")   // 186 120 173
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sha256(var m: KdfBuf, n0: Int, var out: Digest) []
+    out.clear()
+    var n = n0
+    if n > m.len()
+        n = m.len()
+    var st = Sha256 { h0: 0x6A09E667, h1: 0xBB67AE85, h2: 0x3C6EF372, h3: 0xA54FF53A, h4: 0x510E527F, h5: 0x9B05688C,
+                      h6: 0x1F83D9AB, h7: 0x5BE0CD19, len: 0 }
+    let full = n / 64
+    for i in 0..full
+        st = sha256_core.compress(st, block_at(var m, 64 * i))
+    // The tail: what is left, 0x80, zeros, and the length in bits.
+    var tail: KdfBuf = Vec.new()
+    for i in 64 * full..n
+        let _p = tail.push(m[i])
+    let _q = tail.push(0x80)
+    let blocks = if tail.len() <= 56
+        1
+    else
+        2
+    for _z in tail.len()..64 * blocks - 8
+        let _r = tail.push(0)
+    let nbits = n * 8
+    for k in 0..8
+        let _s = tail.push(((nbits >> (8 * (7 - k))) & 0xFF) as u8)
+    for j in 0..blocks
+        st = sha256_core.compress(st, block_at(var tail, 64 * j))
+    push_word(var out, st.h0)
+    push_word(var out, st.h1)
+    push_word(var out, st.h2)
+    push_word(var out, st.h3)
+    push_word(var out, st.h4)
+    push_word(var out, st.h5)
+    push_word(var out, st.h6)
+    push_word(var out, st.h7)
+
+// HMAC-SHA-256 of RFC 2104 and RFC 4231: SHA-256((K0 ^ opad) ‖ SHA-256((K0 ^
+// ipad) ‖ msg)), where K0 is the key padded with zeros to 64 bytes, or its
+// SHA-256 so padded if it is longer than 64.  The message is limited to 192
+// bytes by the room beside the pad; a longer one is cut to it.
+//
+// ```novo
+// use osckdf
+//
+// fn main() [io]
+//     // RFC 4231 test case 2: key "Jefe", data "what do ya want for nothing?".
+//     var key: Vec[u8; 256] = Vec.new()
+//     for b in [0x4a, 0x65, 0x66, 0x65]
+//         let _a = key.push(b as u8)
+//     var msg: Vec[u8; 256] = Vec.new()
+//     for b in [0x77, 0x68, 0x61, 0x74, 0x20, 0x64, 0x6f, 0x20, 0x79, 0x61, 0x20, 0x77, 0x61, 0x6e, 0x74, 0x20,
+//               0x66, 0x6f, 0x72, 0x20, 0x6e, 0x6f, 0x74, 0x68, 0x69, 0x6e, 0x67, 0x3f]
+//         let _b = msg.push(b as u8)
+//     var mac: Vec[u8; 32] = Vec.new()
+//     osckdf.hmac_sha256(var key, 4, var msg, msg.len(), var mac)
+//     println("${mac[0]} ${mac[1]} ${mac[31]}")   // 91 220 67
+// ```
+pub @tier(embedded)
+@no_alloc
+fn hmac_sha256(var key: KdfBuf, klen0: Int, var msg: KdfBuf, mlen0: Int, var out: Digest) []
+    var klen = klen0
+    if klen > key.len()
+        klen = key.len()
+    var mlen = mlen0
+    if mlen > msg.len()
+        mlen = msg.len()
+    if mlen > 192
+        mlen = 192
+    // K0, in 64 bytes.
+    var k0: KdfBuf = Vec.new()
+    if klen > 64
+        var hk: Digest = Vec.new()
+        sha256(var key, klen, var hk)
+        for i in 0..32
+            let _a = k0.push(hk[i])
+    else
+        for i in 0..klen
+            let _b = k0.push(key[i])
+    for _z in k0.len()..64
+        let _c = k0.push(0)
+    // The inner hash: (K0 ^ ipad) ‖ msg.
+    var inner: KdfBuf = Vec.new()
+    for i in 0..64
+        let _d = inner.push((k0[i] as Int ^ 0x36) as u8)
+    for i in 0..mlen
+        let _e = inner.push(msg[i])
+    var ih: Digest = Vec.new()
+    sha256(var inner, 64 + mlen, var ih)
+    // The outer hash: (K0 ^ opad) ‖ inner digest.
+    var outer: KdfBuf = Vec.new()
+    for i in 0..64
+        let _f = outer.push((k0[i] as Int ^ 0x5C) as u8)
+    for i in 0..32
+        let _g = outer.push(ih[i])
+    sha256(var outer, 96, var out)
+
+// HKDF-Extract of RFC 5869 section 2.2: the pseudorandom key
+// HMAC-SHA-256(salt, ikm) in `prk`.
+//
+// An empty salt (`slen` 0) is the same as a salt of 32 zero bytes, because HMAC
+// pads a short key with zeros.  The input keying material is limited to 192
+// bytes.
+pub @tier(embedded)
+@no_alloc
+fn hkdf_extract(var salt: KdfBuf, slen: Int, var ikm: KdfBuf, ilen: Int, var prk: Digest) []
+    hmac_sha256(var salt, slen, var ikm, ilen, var prk)
+
+// The first block of HKDF-Expand, RFC 5869 section 2.3: T(1) =
+// HMAC-SHA-256(prk, info ‖ 0x01), 32 bytes, in `out`.
+//
+// A caller that needs no more than 32 bytes of output, as OSCORE never does
+// (a key is 16 bytes and the Common IV 13), reads the first `L` of them.  The
+// info is limited to 191 bytes.
+pub @tier(embedded)
+@no_alloc
+fn hkdf_expand_first(var prk: Digest, var info: KdfBuf, ilen: Int, var out: Digest) []
+    var key: KdfBuf = Vec.new()
+    for i in 0..prk.len()
+        let _a = key.push(prk[i])
+    var msg: KdfBuf = Vec.new()
+    var n = ilen
+    if n > 191
+        n = 191
+    if n > info.len()
+        n = info.len()
+    for i in 0..n
+        let _b = msg.push(info[i])
+    let _c = msg.push(1)
+    hmac_sha256(var key, prk.len(), var msg, n + 1, var out)

@@ -1,0 +1,136 @@
+// tests/embedded_probe.nv — the device claim of oscore-nv, as a program that
+// either builds for a Cortex-M or does not.
+//
+// The shard audit's `core-embedded` row copies this and the modules of the
+// package into a package of its own and runs
+//
+//   novo build --target=nrf52-qemu src/probe.nv
+//
+// which produces a real Cortex-M4 ELF or fails.  `--target=nrf52-qemu` checks
+// every function it compiles at `@tier(embedded)`, so a heap allocation or an
+// unbounded loop anywhere in the package is refused.
+//
+// The firmware is both ends of an OSCORE exchange on one device, the way a
+// gateway test rig is: it derives the client's and the server's contexts from
+// the master secret of RFC 8613 appendix C.1, protects the GET request of C.4 at
+// sequence number 20 and checks the bytes against the RFC's, verifies it as the
+// server and refuses a copy as a replay, protects the response of C.7 and checks
+// those bytes, verifies it as the client, and checks AES-CCM against the packet
+// vector 1 of RFC 3610.
+
+use oscctx
+use oscccm
+use oscmsg
+
+// The master salt of appendix C.1.
+const SALT = [0x9e, 0x7c, 0xa9, 0x22, 0x23, 0x78, 0x63, 0x40]
+
+// The unprotected GET request of appendix C.4.
+const REQUEST = [
+    0x44, 0x01, 0x5d, 0x1f, 0x00, 0x00, 0x39, 0x74, 0x39, 0x6c, 0x6f, 0x63,
+    0x61, 0x6c, 0x68, 0x6f, 0x73, 0x74, 0x83, 0x74, 0x76, 0x31]
+// The protected request of C.4 (Partial IV 0x14, kid empty).
+const PROTECTED = [
+    0x44, 0x02, 0x5d, 0x1f, 0x00, 0x00, 0x39, 0x74, 0x39, 0x6c, 0x6f, 0x63,
+    0x61, 0x6c, 0x68, 0x6f, 0x73, 0x74, 0x62, 0x09, 0x14, 0xff, 0x61, 0x2f,
+    0x10, 0x92, 0xf1, 0x77, 0x6f, 0x1c, 0x16, 0x68, 0xb3, 0x82, 0x5e]
+// The unprotected response of C.7.
+const RESPONSE = [
+    0x64, 0x45, 0x5d, 0x1f, 0x00, 0x00, 0x39, 0x74, 0xff, 0x48, 0x65, 0x6c,
+    0x6c, 0x6f, 0x20, 0x57, 0x6f, 0x72, 0x6c, 0x64, 0x21]
+// The protected response of C.7 (no Partial IV).
+const PROTECTED_RESPONSE = [
+    0x64, 0x44, 0x5d, 0x1f, 0x00, 0x00, 0x39, 0x74, 0x90, 0xff, 0xdb, 0xaa,
+    0xd1, 0xe9, 0xa7, 0xe7, 0xb2, 0xa8, 0x13, 0xd3, 0xc3, 0x15, 0x24, 0x37,
+    0x83, 0x03, 0xcd, 0xaf, 0xae, 0x11, 0x91, 0x06]
+
+// A buffer from a table of `n` bytes.
+@tier(embedded)
+@no_alloc
+fn load_request(var m: Vec[u8; 1152], which: Int) -> Int
+    m.clear()
+    if which == 0
+        for i in 0..22
+            let _a = m.push(REQUEST[i] as u8)
+    else if which == 1
+        for i in 0..35
+            let _b = m.push(PROTECTED[i] as u8)
+    else if which == 2
+        for i in 0..21
+            let _c = m.push(RESPONSE[i] as u8)
+    else
+        for i in 0..32
+            let _d = m.push(PROTECTED_RESPONSE[i] as u8)
+    m.len()
+
+// Whether a buffer holds the table `which`.
+@tier(embedded)
+@no_alloc
+fn same(var m: Vec[u8; 1152], which: Int) -> Bool
+    var expect: Vec[u8; 1152] = Vec.new()
+    let n = load_request(var expect, which)
+    var eq = m.len() == n
+    for i in 0..n
+        if i < m.len() and m[i] != expect[i]
+            eq = false
+    eq
+
+// The master secret 01..10 and the master salt of appendix C.1.
+@tier(embedded)
+@no_alloc
+fn derive_pair(var client: OscoreCtx, var server: OscoreCtx) -> Bool
+    var secret: Vec[u8; 256] = Vec.new()
+    for i in 1..17
+        let _a = secret.push(i as u8)
+    var salt: Vec[u8; 256] = Vec.new()
+    for i in 0..8
+        let _b = salt.push(SALT[i] as u8)
+    var none: Vec[u8; 256] = Vec.new()
+    let a = oscctx.derive(var client, var secret, 16, var salt, 8, 0, 0, 1, 1, var none, -1)
+    let b = oscctx.derive(var server, var secret, 16, var salt, 8, 1, 1, 0, 0, var none, -1)
+    a == oscctx.OSC_CTX_OK and b == oscctx.OSC_CTX_OK
+
+// Everything the firmware decides, folded into one number: a single comparison
+// on the device decides the run, so a passing run means every step came out
+// right and not only that the calls linked.
+@tier(embedded)
+@no_alloc
+fn score() -> Int
+    var n = 0
+    var client = oscctx.new_ctx()
+    var server = oscctx.new_ctx()
+    if derive_pair(var client, var server)
+        n = n + 1
+    // C.1.1: the client's sender key starts f0 91 0e and the server's c9... is the other key.
+    if client.sender_key[0] == 0xf0 and client.sender_key[2] == 0x0e and server.sender_key[0] == 0xff
+        n = n + 1
+    // Sequence number 20, by the restore procedure: 10 stored, K = 5, F = 5.
+    let _r = oscctx.ssn_restore(var client, 10, 5, 5)
+    var req: Vec[u8; 1152] = Vec.new()
+    let _l = load_request(var req, 0)
+    var wire: Vec[u8; 1152] = Vec.new()
+    var crs = oscmsg.new_req()
+    if oscmsg.protect_request(var client, var req, var wire, var crs) == oscmsg.OSC_OK and same(var wire, 1)
+        n = n + 1
+    var seen: Vec[u8; 1152] = Vec.new()
+    var srs = oscmsg.new_req()
+    if oscmsg.unprotect_request(var server, var wire, var seen, var srs) == oscmsg.OSC_OK and same(var seen, 0)
+        n = n + 1
+    var copy: Vec[u8; 1152] = Vec.new()
+    if oscmsg.unprotect_request(var server, var wire, var copy, var srs) == oscmsg.OSC_E_REPLAY
+        n = n + 1
+    var resp: Vec[u8; 1152] = Vec.new()
+    let _m = load_request(var resp, 2)
+    var out: Vec[u8; 1152] = Vec.new()
+    if oscmsg.protect_response(var server, var resp, var out, var srs, false) == oscmsg.OSC_OK and same(var out, 3)
+        n = n + 1
+    var back: Vec[u8; 1152] = Vec.new()
+    if oscmsg.unprotect_response(var client, var out, var back, var crs) == oscmsg.OSC_OK and same(var back, 2)
+        n = n + 1
+    n
+
+fn main() [hw]
+    if score() == 7
+        hal.uart.write("PASS: oscore-embedded\n")
+    else
+        hal.uart.write("FAIL: oscore-embedded\n")

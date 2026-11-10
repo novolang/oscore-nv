@@ -1,0 +1,243 @@
+// oscccm.nv — AES-CCM of RFC 3610 with a 13-byte nonce and an 8-byte tag.
+//
+// AES-CCM-16-64-128 is the one AEAD algorithm an OSCORE implementation has to
+// have (RFC 8613 section 5; COSE algorithm 10, RFC 9053 section 4.2): a
+// 128-bit key, a 13-byte nonce, a 16-bit length field (L = 2) and a tag of 64
+// bits (M = 8).  crypto-nv has the AES block cipher and AES-GCM; this module
+// is CCM over the cipher, in place, with no heap.
+//
+// CCM runs two passes over the message.  CBC-MAC authenticates it: a first
+// block B0 holds the flags, the nonce and the length of the message, the
+// additional data follows, prefixed by its length and padded with zeros to
+// whole blocks, then the message, padded the same way; the tag is the first 8
+// bytes of the last cipher block.  Counter mode encrypts it: block i of the
+// message is XORed with AES of a counter block A_i, which holds the flags 0x01,
+// the nonce and i as two bytes; the tag is encrypted with A_0.
+//
+//   B0 flags   = 0x40 (if there is additional data) | 0x18 ((M - 2) / 2 << 3) | 0x01 (L - 1)
+//   A_i flags  = 0x01
+//
+// The message is in a `CcmBuf` of 1,152 bytes, which is the size of a CoAP message in coap-nv, and is worked on in place: `seal`
+// turns the plaintext from an index into the ciphertext and appends the tag,
+// `open` checks the tag and turns the ciphertext back into the plaintext.  The
+// key is 16 bytes in a `Vec[u8; 16]`.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.
+
+use aes_core
+
+// The size of the tag, in bytes: 8.
+pub const CCM_TAG = 8
+// The size of the nonce, in bytes: 13.
+pub const CCM_NONCE = 13
+// The capacity of a message, ciphertext and tag included.
+pub const CCM_MSG_MAX = 1152
+// The capacity of the additional data.
+pub const CCM_AAD_MAX = 128
+
+// A message being sealed or opened.
+pub alias CcmBuf = Vec[u8; 1152]
+// Additional authenticated data.
+pub alias CcmAad = Vec[u8; 128]
+// A nonce.
+pub alias CcmNonce = Vec[u8; 13]
+// An AES key of 128 bits.
+pub alias CcmKey = Vec[u8; 16]
+// A block of the cipher.
+alias Block16 = Vec[u8; 16]
+
+// The little-endian 64-bit word of the eight bytes of a block from `at`.
+@tier(embedded)
+@no_alloc
+fn word_le(var k: Block16, at: Int) -> Int
+    var v = 0
+    for i in 0..8
+        v = v | (k[at + i] as Int << (8 * i))
+    v
+
+// The expanded key for 16 bytes of key material.
+@tier(embedded)
+@no_alloc
+fn expand(var key: CcmKey) -> AesKey
+    var k: Block16 = Vec.new()
+    for i in 0..16
+        let _p = k.push(key[i])
+    aes_core.expand_key_128(word_le(var k, 0), word_le(var k, 8))
+
+// AES-encrypt a block in place.
+@tier(embedded)
+@no_alloc
+fn encrypt(key: AesKey, var blk: Block16)
+    let out = aes_core.encrypt_block(key, AesBlock { lo: word_le(var blk, 0), hi: word_le(var blk, 8) })
+    for i in 0..8
+        blk[i] = ((out.lo >>> (8 * i)) & 0xFF) as u8
+        blk[8 + i] = ((out.hi >>> (8 * i)) & 0xFF) as u8
+
+// A block of 16 zeros.
+@tier(embedded)
+@no_alloc
+fn zero_block() -> Block16
+    var b: Block16 = Vec.new()
+    for _i in 0..16
+        let _p = b.push(0)
+    b
+
+// The counter block A_i: flags 0x01, the nonce, the counter in two bytes.
+@tier(embedded)
+@no_alloc
+fn counter_block(var nonce: CcmNonce, i: Int) -> Block16
+    var a = zero_block()
+    a[0] = 1
+    for k in 0..13
+        a[1 + k] = nonce[k]
+    a[14] = ((i >> 8) & 0xFF) as u8
+    a[15] = (i & 0xFF) as u8
+    a
+
+// XOR one byte into a block.
+@tier(embedded)
+@no_alloc
+fn xor_at(var x: Block16, i: Int, b: Int)
+    x[i] = (x[i] as Int ^ b) as u8
+
+// The CBC-MAC of the message `msg[from..from + len)` under additional data
+// `aad`: the last cipher block, of which the first 8 bytes are the tag.
+@tier(embedded)
+@no_alloc
+fn cbc_mac(key: AesKey, var nonce: CcmNonce, var aad: CcmAad, var msg: CcmBuf, from: Int,
+           len: Int) -> Block16
+    var x = zero_block()
+    // B0.
+    var flags = 0x19
+    if aad.len() > 0
+        flags = 0x59
+    x[0] = flags as u8
+    for k in 0..13
+        x[1 + k] = nonce[k]
+    x[14] = ((len >> 8) & 0xFF) as u8
+    x[15] = (len & 0xFF) as u8
+    encrypt(key, var x)
+    // The additional data: its length in two bytes, the bytes, zero padding.
+    let alen = aad.len()
+    if alen > 0
+        let stream = alen + 2
+        let padded = (stream + 15) / 16 * 16
+        for j in 0..padded
+            var b = 0
+            if j == 0
+                b = alen >> 8
+            else if j == 1
+                b = alen & 0xFF
+            else if j - 2 < alen
+                b = aad[j - 2] as Int
+            xor_at(var x, j % 16, b)
+            if j % 16 == 15
+                encrypt(key, var x)
+    // The message, zero padded to whole blocks.
+    let padded_msg = (len + 15) / 16 * 16
+    for j in 0..padded_msg
+        var b = 0
+        if j < len
+            b = msg[from + j] as Int
+        xor_at(var x, j % 16, b)
+        if j % 16 == 15
+            encrypt(key, var x)
+    x
+
+// XOR the counter-mode key stream into `msg[from..from + len)`.
+@tier(embedded)
+@no_alloc
+fn ctr(key: AesKey, var nonce: CcmNonce, var msg: CcmBuf, from: Int, len: Int)
+    var s = zero_block()
+    for j in 0..len
+        if j % 16 == 0
+            s = counter_block(var nonce, 1 + j / 16)
+            encrypt(key, var s)
+        msg[from + j] = (msg[from + j] as Int ^ s[j % 16] as Int) as u8
+
+// The tag of a message: the first 8 bytes of the CBC-MAC XORed with the first
+// 8 bytes of AES(A_0), as an array of 8 bytes in a block.
+@tier(embedded)
+@no_alloc
+fn tag_of(key: AesKey, var nonce: CcmNonce, mac: Block16) -> Block16
+    var s = counter_block(var nonce, 0)
+    encrypt(key, var s)
+    var t = zero_block()
+    for i in 0..8
+        t[i] = (mac[i] as Int ^ s[i] as Int) as u8
+    t
+
+// Seal the plaintext `msg[from..]` in place and append the 8-byte tag.
+//
+// `nonce` has to be new for every message under one key: CCM, like any counter
+// mode, gives up both secrecy and authenticity when a nonce is used twice.
+// Answers false, and leaves `msg` as it was, when the message is longer than
+// 65,535 bytes, when there is no room for the tag, or `from` is not inside the
+// buffer.
+//
+// ```novo
+// use oscccm
+//
+// fn main() [io]
+//     // RFC 3610 packet vector 1: the key C0..CF, the nonce 00000003020100A0..A5,
+//     // 8 bytes of additional data 00..07 and the plaintext 08..1E.
+//     var key: Vec[u8; 16] = Vec.new()
+//     for i in 0..16
+//         let _a = key.push((0xC0 + i) as u8)
+//     var nonce: Vec[u8; 13] = Vec.new()
+//     for b in [0x00, 0x00, 0x00, 0x03, 0x02, 0x01, 0x00, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5]
+//         let _b = nonce.push(b as u8)
+//     var aad: Vec[u8; 128] = Vec.new()
+//     for i in 0..8
+//         let _c = aad.push(i as u8)
+//     var msg: Vec[u8; 1152] = Vec.new()
+//     for i in 8..31
+//         let _d = msg.push(i as u8)
+//     let ok = oscccm.seal(var key, var nonce, var aad, var msg, 0)
+//     println("${ok} ${msg.len()} ${msg[0]} ${msg[30]}")   // true 31 88 224
+// ```
+pub @tier(embedded)
+@no_alloc
+fn seal(var key: CcmKey, var nonce: CcmNonce, var aad: CcmAad, var msg: CcmBuf,
+        from: Int) -> Bool []
+    let len = msg.len() - from
+    if from < 0 or len < 0 or len > 65535 or msg.len() + CCM_TAG > msg.capacity()
+        return false
+    let k = expand(var key)
+    let mac = cbc_mac(k, var nonce, var aad, var msg, from, len)
+    let t = tag_of(k, var nonce, mac)
+    ctr(k, var nonce, var msg, from, len)
+    for i in 0..CCM_TAG
+        let _p = msg.push(t[i])
+    true
+
+// Open the ciphertext and tag `msg[from..]` in place.
+//
+// On success the 8-byte tag is taken off the end and the bytes from `from` are
+// the plaintext, and the answer is true.  On failure the answer is false and
+// `msg` is emptied: the tag is compared in time that does not depend on where
+// it differs, and no plaintext is left behind for a message that did not
+// verify.  A message shorter than the tag, a `from` outside the buffer, and a
+// plaintext longer than 65,535 bytes fail the same way.
+pub @tier(embedded)
+@no_alloc
+fn open(var key: CcmKey, var nonce: CcmNonce, var aad: CcmAad, var msg: CcmBuf,
+        from: Int) -> Bool []
+    let total = msg.len() - from
+    if from < 0 or total < CCM_TAG or total - CCM_TAG > 65535
+        msg.clear()
+        return false
+    let len = total - CCM_TAG
+    let k = expand(var key)
+    ctr(k, var nonce, var msg, from, len)
+    let mac = cbc_mac(k, var nonce, var aad, var msg, from, len)
+    let t = tag_of(k, var nonce, mac)
+    var diff = 0
+    for i in 0..CCM_TAG
+        diff = diff | (t[i] as Int ^ msg[from + len + i] as Int)
+    if diff != 0
+        msg.clear()
+        return false
+    for _i in 0..CCM_TAG
+        let _p = msg.pop()
+    true

@@ -1,0 +1,511 @@
+// oscore_edge_tests.nv — the OSCORE option, the context, and protection beyond
+// the RFC's own vectors.
+//
+// The option values of RFC 8613 section 6.3 are the first five examples, byte for
+// byte.  The additional data is the example of section 5.4.  Everything else is
+// derived by hand from the sections named in the comments: the replay window of
+// section 7.4, the sequence number of sections 3.2.2 and 7.2.1 and Appendix B.1.1,
+// the option classes of section 4.1, the Observe rules of sections 4.1.3.5 and
+// 8.4.2, and each way a message is refused.
+//
+// The contexts are those of appendix C.1: master secret 01..10, master salt
+// 9e7ca92223786340, the client with the empty Sender ID and Recipient ID 01, the
+// server the other way round.
+
+use std.test
+use std.bytes
+use std.str
+use oscctx
+use oscopt
+use oscmsg
+
+fn h(s: Str) -> Bytes
+    bytes.from_hex(s) ?? bytes.zeros(0)
+
+fn load256(s: Str) -> Vec[u8; 256]
+    var m: Vec[u8; 256] = Vec.new()
+    let raw = h(s)
+    for i in 0..bytes.len(raw)
+        let _p = m.push((bytes.byte_at(raw, i) ?? 0) as u8)
+    m
+
+fn msg(s: Str) -> Vec[u8; 1152]
+    var m: Vec[u8; 1152] = Vec.new()
+    let raw = h(s)
+    for i in 0..bytes.len(raw)
+        let _p = m.push((bytes.byte_at(raw, i) ?? 0) as u8)
+    m
+
+fn hx(var m: Vec[u8; 1152]) -> Str
+    var b = bytes.zeros(m.len())
+    for i in 0..m.len()
+        bytes.set_u8(b, i, m[i] as Int)
+    bytes.to_hex(b)
+
+fn hx128(var m: Vec[u8; 128]) -> Str
+    var b = bytes.zeros(m.len())
+    for i in 0..m.len()
+        bytes.set_u8(b, i, m[i] as Int)
+    bytes.to_hex(b)
+
+fn hx48(var m: Vec[u8; 48]) -> Str
+    var b = bytes.zeros(m.len())
+    for i in 0..m.len()
+        bytes.set_u8(b, i, m[i] as Int)
+    bytes.to_hex(b)
+
+fn derive_with(sid: Int, sid_len: Int, rid: Int, rid_len: Int, ctx_len: Int) -> OscoreCtx
+    var secret = load256("0102030405060708090a0b0c0d0e0f10")
+    var salt = load256("9e7ca92223786340")
+    var idc = load256("37cbf3210017a2d3")
+    var c = oscctx.new_ctx()
+    let _r = oscctx.derive(var c, var secret, 16, var salt, 8, sid, sid_len, rid, rid_len, var idc, ctx_len)
+    c
+
+fn client() -> OscoreCtx
+    derive_with(0, 0, 1, 1, -1)
+
+fn server() -> OscoreCtx
+    derive_with(1, 1, 0, 0, -1)
+
+fn status_of(r: Int) -> Int
+    r
+
+// ── the option value ────────────────────────────────────────────────
+
+@test
+fn test_the_option_values_of_rfc_8613_section_6_3() [io]
+    var none: Vec[u8; 32] = Vec.new()
+    var out: Vec[u8; 48] = Vec.new()
+    test.case("1: kid 25, Partial IV 05: flags 0x09")
+    test.assert_eq(oscopt.encode(var out, 5, 1, true, 0x25, 1, false, var none), 3)
+    test.assert_eq_str(hx48(var out), "090525")
+    test.case("2: an empty kid and Partial IV 00: 0x0900")
+    test.assert_eq(oscopt.encode(var out, 0, 1, true, 0, 0, false, var none), 2)
+    test.assert_eq_str(hx48(var out), "0900")
+    test.case("3: an empty kid, Partial IV 05, kid context 44616c656b: 0x19050544616c656b")
+    var ctx: Vec[u8; 32] = Vec.new()
+    for b in [0x44, 0x61, 0x6c, 0x65, 0x6b]
+        let _a = ctx.push(b as u8)
+    test.assert_eq(oscopt.encode(var out, 5, 1, true, 0, 0, true, var ctx), 8)
+    test.assert_eq_str(hx48(var out), "19050544616c656b")
+    test.case("4: no Partial IV, no kid: the option is empty, not a lone zero byte")
+    test.assert_eq(oscopt.encode(var out, 0, 0, false, 0, 0, false, var none), 0)
+    test.assert_eq(out.len(), 0)
+    test.case("5: Partial IV 07 alone: 0x0107")
+    test.assert_eq(oscopt.encode(var out, 7, 1, false, 0, 0, false, var none), 2)
+    test.assert_eq_str(hx48(var out), "0107")
+    test.case("a Partial IV of two bytes and a kid of three")
+    test.assert_eq(oscopt.encode(var out, 0x0102, 2, true, 0x030405, 3, false, var none), 6)
+    test.assert_eq_str(hx48(var out), "0a0102030405")
+
+@test
+fn test_the_same_values_are_read_back() [io]
+    test.case("1")
+    var a = msg("090525")
+    let o1 = oscopt.decode(var a, 0, 3)
+    test.assert_eq(o1.ok, true)
+    test.assert_eq(o1.piv, 5)
+    test.assert_eq(o1.piv_len, 1)
+    test.assert_eq(o1.has_kid, true)
+    test.assert_eq(o1.kid, 0x25)
+    test.assert_eq(o1.kid_len, 1)
+    test.assert_eq(o1.has_ctx, false)
+    test.case("2")
+    var b = msg("0900")
+    let o2 = oscopt.decode(var b, 0, 2)
+    test.assert_eq(o2.piv, 0)
+    test.assert_eq(o2.has_kid, true)
+    test.assert_eq(o2.kid_len, 0)
+    test.case("4: an empty value has nothing")
+    var c = msg("")
+    let o4 = oscopt.decode(var c, 0, 0)
+    test.assert_eq(o4.ok, true)
+    test.assert_eq(o4.piv_len, 0)
+    test.assert_eq(o4.has_kid, false)
+    test.case("5")
+    var d = msg("0107")
+    let o5 = oscopt.decode(var d, 0, 2)
+    test.assert_eq(o5.piv, 7)
+    test.assert_eq(o5.has_kid, false)
+    test.case("read at an offset inside a longer message")
+    var e = msg("aabb0107cc")
+    let o6 = oscopt.decode(var e, 2, 2)
+    test.assert_eq(o6.piv, 7)
+    test.case("a Partial IV of five bytes")
+    var f = msg("0501020304ff")
+    let o7 = oscopt.decode(var f, 0, 6)
+    test.assert_eq(o7.piv, 0x01020304ff)
+    test.assert_eq(o7.piv_len, 5)
+
+@test
+fn test_an_option_value_that_is_malformed_is_not_ok() [io]
+    test.case("a reserved flag bit")
+    var a = msg("2900")
+    test.assert_eq(oscopt.decode(var a, 0, 2).ok, false)
+    test.case("a Partial IV length of 6 and 7")
+    var b = msg("06010203040506")
+    test.assert_eq(oscopt.decode(var b, 0, 7).ok, false)
+    var c = msg("0701020304050607")
+    test.assert_eq(oscopt.decode(var c, 0, 8).ok, false)
+    test.case("a Partial IV that runs past the value")
+    var d = msg("0301")
+    test.assert_eq(oscopt.decode(var d, 0, 2).ok, false)
+    test.case("a kid context flag and no length byte")
+    var e = msg("10")
+    test.assert_eq(oscopt.decode(var e, 0, 1).ok, false)
+    test.case("a kid context longer than the value")
+    var f = msg("100544")
+    test.assert_eq(oscopt.decode(var f, 0, 3).ok, false)
+    test.case("a kid context of 33 bytes")
+    var g = msg("1021" + "00000000000000000000000000000000" + "00000000000000000000000000000000" + "00")
+    test.assert_eq(oscopt.decode(var g, 0, 35).ok, false)
+    test.case("a kid of 8 bytes")
+    var k = msg("08" + "0001020304050607")
+    test.assert_eq(oscopt.decode(var k, 0, 9).ok, false)
+    test.case("bytes after everything with the kid flag clear")
+    var l = msg("0105aa")
+    test.assert_eq(oscopt.decode(var l, 0, 3).ok, false)
+    test.case("a window outside the message")
+    var m = msg("0107")
+    test.assert_eq(oscopt.decode(var m, 1, 4).ok, false)
+    test.assert_eq(oscopt.decode(var m, -1, 2).ok, false)
+
+// ── CoAP options ────────────────────────────────────────────────────
+
+@test
+fn test_options_are_read_and_written_with_their_extended_forms() [io]
+    test.case("a delta of 13 or more takes one byte: option 258 after 0 is d... delta 258 = 13 + 245")
+    var out: Vec[u8; 1152] = Vec.new()
+    var src = msg("aabbcc")
+    test.assert_eq(oscopt.put_option(var out, 0, 258, var src, 0, 3), true)
+    test.assert_eq_str(hx(var out), "d3f5aabbcc")
+    let r = oscopt.read_option(var out, 0, out.len(), 0)
+    test.assert_eq(r.ok, true)
+    test.assert_eq(r.number, 258)
+    test.assert_eq(r.vlen, 3)
+    test.assert_eq(r.next, 5)
+    test.case("a delta of 269 or more takes two: option 300 after 0 is 14 with 300 - 269 = 31")
+    var out2: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscopt.put_option(var out2, 0, 300, var src, 0, 1), true)
+    test.assert_eq_str(hx(var out2), "e1001faa")
+    let r2 = oscopt.read_option(var out2, 0, out2.len(), 0)
+    test.assert_eq(r2.number, 300)
+    test.assert_eq(r2.vlen, 1)
+    test.case("a length of 13 takes one byte, of 269 two")
+    var long = msg("aa")
+    for _i in 0..299
+        let _p = long.push(0x55)
+    var out3: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscopt.put_option(var out3, 0, 1, var long, 0, 13), true)
+    test.assert_eq(out3[0] as Int, 0x1D)
+    test.assert_eq(out3[1] as Int, 0)
+    var out4: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscopt.put_option(var out4, 0, 1, var long, 0, 300), true)
+    test.assert_eq(out4[0] as Int, 0x1E)
+    test.assert_eq(out4[1] as Int, 0)
+    test.assert_eq(out4[2] as Int, 31)
+    let r4 = oscopt.read_option(var out4, 0, out4.len(), 0)
+    test.assert_eq(r4.vlen, 300)
+    test.case("an option below the last, a number past 65535 and a full message are refused")
+    var out5: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscopt.put_option(var out5, 5, 4, var src, 0, 1), false)
+    test.assert_eq(oscopt.put_option(var out5, 0, 70000, var src, 0, 1), false)
+    var full: Vec[u8; 1152] = Vec.new()
+    for _i in 0..1150
+        let _q = full.push(0)
+    test.assert_eq(oscopt.put_option(var full, 0, 1, var src, 0, 3), false)
+    test.case("an option value built from a buffer")
+    var val: Vec[u8; 48] = Vec.new()
+    let _a = val.push(0x09)
+    let _b = val.push(0x14)
+    var out6: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscopt.put_option_val(var out6, 7, 9, var val), true)
+    test.assert_eq_str(hx(var out6), "220914")
+    var out7: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscopt.put_option_val(var out7, 12, 9, var val), false)
+    test.case("an integer option takes the fewest bytes, 0 none")
+    var out8: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscopt.put_uint(var out8, 0, 6, 0), true)
+    test.assert_eq(oscopt.put_uint(var out8, 6, 7, 258), true)
+    test.assert_eq_str(hx(var out8), "6012" + "0102")
+    var out9: Vec[u8; 1152] = Vec.new()
+    test.assert_eq(oscopt.put_uint(var out9, 9, 6, 1), false)
+
+@test
+fn test_an_option_that_does_not_parse_is_not_ok() [io]
+    test.case("a delta nibble of 15, a length nibble of 15")
+    var a = msg("f1aa")
+    test.assert_eq(oscopt.read_option(var a, 0, 2, 0).ok, false)
+    var b = msg("1faa")
+    test.assert_eq(oscopt.read_option(var b, 0, 2, 0).ok, false)
+    test.case("a value that runs past the end")
+    var c = msg("13aa")
+    test.assert_eq(oscopt.read_option(var c, 0, 2, 0).ok, false)
+    test.case("an extension byte that is missing")
+    var d = msg("d1")
+    test.assert_eq(oscopt.read_option(var d, 0, 1, 0).ok, false)
+    var e = msg("e1")
+    test.assert_eq(oscopt.read_option(var e, 0, 1, 0).ok, false)
+    var f = msg("1d")
+    test.assert_eq(oscopt.read_option(var f, 0, 1, 0).ok, false)
+    var g = msg("1e00")
+    test.assert_eq(oscopt.read_option(var g, 0, 2, 0).ok, false)
+    test.case("a position at or past the end, or negative, and an end past the buffer")
+    var k = msg("11aa")
+    test.assert_eq(oscopt.read_option(var k, 2, 2, 0).ok, false)
+    test.assert_eq(oscopt.read_option(var k, -1, 2, 0).ok, false)
+    test.assert_eq(oscopt.read_option(var k, 0, 9, 0).ok, false)
+
+// ── the additional data ─────────────────────────────────────────────
+
+@test
+fn test_the_additional_data_is_the_enc_structure_of_section_5_4() [io]
+    var aad: Vec[u8; 128] = Vec.new()
+    test.case("the example of section 5.4: kid 00, Partial IV 25, AES-CCM-16-64-128")
+    oscmsg.make_aad(var aad, 0, 1, 0x25, 1)
+    test.assert_eq_str(hx128(var aad), "8368456e63727970743040498501810a4100412540")
+    test.case("an empty kid and Partial IV 14, as in appendix C.4")
+    oscmsg.make_aad(var aad, 0, 0, 0x14, 1)
+    test.assert_eq_str(hx128(var aad), "8368456e63727970743040488501810a40411440")
+    test.case("a kid of seven bytes and a Partial IV of five")
+    oscmsg.make_aad(var aad, 0x01020304050607, 7, 0x0102030405, 5)
+    test.assert_eq_str(hx128(var aad),
+        "8368456e63727970743040" + "53" + "8501810a" + "47" + "01020304050607" + "45" + "0102030405" + "40")
+
+// ── the context ─────────────────────────────────────────────────────
+
+@test
+fn test_a_context_is_refused_for_an_identifier_that_is_too_long_and_for_inputs_that_do_not_fit() [io]
+    var secret = load256("0102030405060708090a0b0c0d0e0f10")
+    var salt = load256("")
+    var none = load256("")
+    var c = oscctx.new_ctx()
+    test.case("an identifier of 8 bytes, and a negative length")
+    test.assert_eq(oscctx.derive(var c, var secret, 16, var salt, 0, 0, 8, 0, 0, var none, -1),
+        oscctx.OSC_CTX_BAD_ID)
+    test.assert_eq(oscctx.derive(var c, var secret, 16, var salt, 0, 0, 0, 0, 8, var none, -1),
+        oscctx.OSC_CTX_BAD_ID)
+    test.assert_eq(oscctx.derive(var c, var secret, 16, var salt, 0, 0, -1, 0, 0, var none, -1),
+        oscctx.OSC_CTX_BAD_ID)
+    test.assert_eq(oscctx.derive(var c, var secret, 16, var salt, 0, 0, 0, 0, -1, var none, -1),
+        oscctx.OSC_CTX_BAD_ID)
+    test.case("a secret over 192 bytes, a negative length, an ID Context over 32")
+    test.assert_eq(oscctx.derive(var c, var secret, 193, var salt, 0, 0, 0, 0, 0, var none, -1),
+        oscctx.OSC_CTX_TOO_LONG)
+    test.assert_eq(oscctx.derive(var c, var secret, -1, var salt, 0, 0, 0, 0, 0, var none, -1),
+        oscctx.OSC_CTX_TOO_LONG)
+    test.assert_eq(oscctx.derive(var c, var secret, 16, var salt, -1, 0, 0, 0, 0, var none, -1),
+        oscctx.OSC_CTX_TOO_LONG)
+    test.assert_eq(oscctx.derive(var c, var secret, 16, var salt, 257, 0, 0, 0, 0, var none, -1),
+        oscctx.OSC_CTX_TOO_LONG)
+    test.assert_eq(oscctx.derive(var c, var secret, 16, var salt, 0, 0, 0, 0, 0, var none, 33),
+        oscctx.OSC_CTX_TOO_LONG)
+    test.case("identifiers of seven bytes are accepted")
+    test.assert_eq(oscctx.derive(var c, var secret, 16, var salt, 0, 0x01020304050607, 7, 0x0a0b0c0d0e0f10, 7, var none, -1),
+                   oscctx.OSC_CTX_OK)
+    test.assert_eq(c.sender_id, 0x01020304050607)
+    test.assert_eq(c.recipient_id_len, 7)
+
+@test
+fn test_an_empty_id_context_is_not_the_same_as_none() [io]
+    var secret = load256("0102030405060708090a0b0c0d0e0f10")
+    var salt = load256("")
+    var none = load256("")
+    var a = oscctx.new_ctx()
+    var b = oscctx.new_ctx()
+    let _x = oscctx.derive(var a, var secret, 16, var salt, 0, 0, 0, 1, 1, var none, -1)
+    let _y = oscctx.derive(var b, var secret, 16, var salt, 0, 0, 0, 1, 1, var none, 0)
+    test.assert_eq(a.has_id_context, false)
+    test.assert_eq(b.has_id_context, true)
+    test.assert_eq(b.id_context.len(), 0)
+    test.assert_eq(a.sender_key[0] != b.sender_key[0] or a.sender_key[1] != b.sender_key[1], true)
+
+@test
+fn test_the_nonce_is_the_id_and_the_partial_iv_xored_into_the_common_iv() [io]
+    var c = client()
+    test.case("C.1: the sender ID is empty, so the nonce of Partial IV 0 is the Common IV")
+    var n0 = oscctx.nonce(var c.common_iv, 0, 0, 0)
+    test.assert_eq(n0[0] as Int, 0x46)
+    test.assert_eq(n0[12] as Int, 0x7c)
+    test.case("a Partial IV of five bytes touches the last five")
+    var n1 = oscctx.nonce(var c.common_iv, 0, 0, 0xFFFFFFFFFF)
+    test.assert_eq(n1[7] as Int, 0x68)
+    test.assert_eq(n1[8] as Int, 0xee ^ 0xFF)
+    test.assert_eq(n1[12] as Int, 0x7c ^ 0xFF)
+    test.case("an ID of seven bytes fills bytes 1 to 7 and the length byte is 7")
+    var n2 = oscctx.nonce(var c.common_iv, 0x01020304050607, 7, 0)
+    test.assert_eq(n2[0] as Int, 0x46 ^ 7)
+    test.assert_eq(n2[1] as Int, 0x22 ^ 1)
+    test.assert_eq(n2[7] as Int, 0x68 ^ 7)
+
+@test
+fn test_a_partial_iv_takes_the_fewest_bytes_and_zero_takes_one() [io]
+    test.assert_eq(oscctx.piv_len(0), 1)
+    test.assert_eq(oscctx.piv_len(255), 1)
+    test.assert_eq(oscctx.piv_len(256), 2)
+    test.assert_eq(oscctx.piv_len(65535), 2)
+    test.assert_eq(oscctx.piv_len(65536), 3)
+    test.assert_eq(oscctx.piv_len(0x1000000), 4)
+    test.assert_eq(oscctx.piv_len(0x100000000), 5)
+    test.assert_eq(oscctx.piv_len(oscctx.OSC_SSN_MAX), 5)
+
+@test
+fn test_the_sequence_number_advances_stops_at_two_to_the_forty_and_is_restored() [io]
+    var c = oscctx.new_ctx()
+    test.case("0, 1, 2")
+    test.assert_eq(oscctx.ssn_next(var c), 0)
+    test.assert_eq(oscctx.ssn_next(var c), 1)
+    test.assert_eq(oscctx.ssn_next(var c), 2)
+    test.case("after a reboot: stored 100, K 50, F 10 gives 160")
+    test.assert_eq(oscctx.ssn_restore(var c, 100, 50, 10), true)
+    test.assert_eq(c.ssn, 160)
+    test.case("a store is due before a number divisible by K: 160 / 50 is not, 200 / 50 is")
+    test.assert_eq(oscctx.ssn_needs_store(c, 50), false)
+    test.assert_eq(oscctx.ssn_restore(var c, 100, 50, 50), true)
+    test.assert_eq(c.ssn, 200)
+    test.assert_eq(oscctx.ssn_needs_store(c, 50), true)
+    test.assert_eq(oscctx.ssn_needs_store(c, 0), false)
+    test.case("a restore with a K or F that is not positive, or a sum past 2^40 - 1, changes nothing")
+    test.assert_eq(oscctx.ssn_restore(var c, 100, 0, 10), false)
+    test.assert_eq(oscctx.ssn_restore(var c, 100, 10, 0), false)
+    test.assert_eq(oscctx.ssn_restore(var c, -1, 10, 10), false)
+    test.assert_eq(oscctx.ssn_restore(var c, oscctx.OSC_SSN_MAX, 1, 1), false)
+    test.assert_eq(c.ssn, 200)
+    test.case("the last number is 2^40 - 1 and then there are none")
+    test.assert_eq(oscctx.ssn_restore(var c, oscctx.OSC_SSN_MAX - 5, 1, 3), true)
+    test.assert_eq(oscctx.ssn_next(var c), oscctx.OSC_SSN_MAX - 1)
+    test.assert_eq(oscctx.ssn_next(var c), oscctx.OSC_SSN_MAX)
+    test.assert_eq(oscctx.ssn_next(var c), -1)
+    test.assert_eq(oscctx.ssn_next(var c), -1)
+
+@test
+fn test_the_replay_window_accepts_each_number_once_and_nothing_older_than_32() [io]
+    var c = oscctx.new_ctx()
+    test.case("an empty window accepts anything below 2^40")
+    test.assert_eq(oscctx.replay_ok(c, 0), true)
+    test.assert_eq(oscctx.replay_ok(c, oscctx.OSC_SSN_MAX), true)
+    test.assert_eq(oscctx.replay_ok(c, oscctx.OSC_SSN_MAX + 1), false)
+    test.case("100 received: 100 is seen, 99 down to 69 are free, 68 is too old")
+    oscctx.replay_commit(var c, 100)
+    test.assert_eq(oscctx.replay_ok(c, 100), false)
+    test.assert_eq(oscctx.replay_ok(c, 99), true)
+    test.assert_eq(oscctx.replay_ok(c, 69), true)
+    test.assert_eq(oscctx.replay_ok(c, 68), false)
+    test.assert_eq(oscctx.replay_ok(c, 101), true)
+    test.case("99 received out of order: it is seen, 98 still free")
+    oscctx.replay_commit(var c, 99)
+    test.assert_eq(oscctx.replay_ok(c, 99), false)
+    test.assert_eq(oscctx.replay_ok(c, 98), true)
+    test.case("102 moves the window up by two and keeps what was seen")
+    oscctx.replay_commit(var c, 102)
+    test.assert_eq(oscctx.replay_ok(c, 100), false)
+    test.assert_eq(oscctx.replay_ok(c, 99), false)
+    test.assert_eq(oscctx.replay_ok(c, 101), true)
+    test.assert_eq(oscctx.replay_ok(c, 102), false)
+    test.assert_eq(oscctx.replay_ok(c, 71), true)
+    test.assert_eq(oscctx.replay_ok(c, 70), false)
+    test.case("a jump of 32 or more forgets the window")
+    oscctx.replay_commit(var c, 134)
+    test.assert_eq(oscctx.replay_ok(c, 134), false)
+    test.assert_eq(oscctx.replay_ok(c, 100), false)
+    test.assert_eq(oscctx.replay_ok(c, 102), false)
+    test.assert_eq(oscctx.replay_ok(c, 103), true)
+    test.case("a jump of 31 keeps the highest of the old ones")
+    oscctx.replay_commit(var c, 165)
+    test.assert_eq(oscctx.replay_ok(c, 134), false)
+    test.assert_eq(oscctx.replay_ok(c, 135), true)
+
+@test
+fn test_the_lower_limit_of_the_replay_window_refuses_everything_below_it() [io]
+    var c = oscctx.new_ctx()
+    oscctx.replay_floor(var c, 50)
+    test.assert_eq(oscctx.replay_ok(c, 49), false)
+    test.assert_eq(oscctx.replay_ok(c, 50), true)
+    test.assert_eq(c.win_floor, 50)
+    oscctx.replay_commit(var c, 50)
+    test.assert_eq(oscctx.replay_ok(c, 50), false)
+    test.assert_eq(oscctx.replay_ok(c, 51), true)
+
+@test
+fn test_a_recipient_context_is_found_by_kid_and_kid_context() [io]
+    var with_ctx = derive_with(1, 1, 2, 1, 8)
+    var none: Vec[u8; 32] = Vec.new()
+    var same: Vec[u8; 32] = Vec.new()
+    for b in [0x37, 0xcb, 0xf3, 0x21, 0x00, 0x17, 0xa2, 0xd3]
+        let _a = same.push(b as u8)
+    var other: Vec[u8; 32] = Vec.new()
+    for b in [0x37, 0xcb, 0xf3, 0x21, 0x00, 0x17, 0xa2, 0xd4]
+        let _b = other.push(b as u8)
+    var short: Vec[u8; 32] = Vec.new()
+    let _c = short.push(0x37)
+    test.case("the Recipient ID is 02")
+    test.assert_eq(oscctx.recipient_matches(with_ctx, 2, 1, false, var none), true)
+    test.assert_eq(oscctx.recipient_matches(with_ctx, 3, 1, false, var none), false)
+    test.assert_eq(oscctx.recipient_matches(with_ctx, 2, 2, false, var none), false)
+    test.assert_eq(oscctx.recipient_matches(with_ctx, 0, 0, false, var none), false)
+    test.case("a request that names the ID Context has to name this one")
+    test.assert_eq(oscctx.recipient_matches(with_ctx, 2, 1, true, var same), true)
+    test.assert_eq(oscctx.recipient_matches(with_ctx, 2, 1, true, var other), false)
+    test.assert_eq(oscctx.recipient_matches(with_ctx, 2, 1, true, var short), false)
+    test.case("a context without an ID Context matches no request that names one")
+    var plain = client()
+    test.assert_eq(oscctx.recipient_matches(plain, 1, 1, true, var same), false)
+    test.assert_eq(oscctx.recipient_matches(plain, 1, 1, false, var none), true)
+
+// ── protecting a request ────────────────────────────────────────────
+
+fn get(path: Str, token: Str) -> Str
+    "41" + "01" + "1234" + token + path
+
+@test
+fn test_a_request_is_split_into_inner_and_outer_options() [io]
+    var c = client()
+    var s = server()
+    // CON GET, MID 1234, token 71.  Uri-Host (3) "h", Uri-Port (7) 5683, Uri-Path (11) "a",
+    // Content-Format (12) 60, Max-Age (14) 5, a payload "hi".
+    //   31 68          Uri-Host
+    //   42 1633        Uri-Port, delta 4
+    //   b1 61          Uri-Path, delta 4
+    //   11 3c          Content-Format, delta 1
+    //   21 05          Max-Age, delta 2
+    //   ff 6869
+    let original = "41011234" + "71" + "3168" + "421633" + "b161" + "113c" + "2105" + "ff6869"
+    var req = msg(original)
+    var wire: Vec[u8; 1152] = Vec.new()
+    var rs = oscmsg.new_req()
+    test.assert_eq(oscmsg.protect_request(var c, var req, var wire, var rs), oscmsg.OSC_OK)
+    test.case("the outer message keeps the type, ID and token, has code POST, Uri-Host and Uri-Port, the option and the ciphertext")
+    test.assert_eq(wire[0] as Int, 0x41)
+    test.assert_eq(wire[1] as Int, 0x02)
+    test.assert_eq(wire[2] as Int, 0x12)
+    test.assert_eq(wire[3] as Int, 0x34)
+    test.assert_eq(wire[4] as Int, 0x71)
+    // Uri-Host 31 68, Uri-Port 42 1633, OSCORE (9) after 7: 22 0900 (flags 0x09, Partial IV 00, kid empty).
+    test.assert_eq_str(str.slice(hx(var wire), 10, 28), "3168" + "421633" + "220900" + "ff")
+    var back: Vec[u8; 1152] = Vec.new()
+    var srs = oscmsg.new_req()
+    test.assert_eq(oscmsg.unprotect_request(var s, var wire, var back, var srs), oscmsg.OSC_OK)
+    test.case("the verified message is the original, in order")
+    test.assert_eq_str(hx(var back), original)
+    test.assert_eq(srs.observe, false)
+
+@test
+fn test_an_id_context_of_24_bytes_or_more_is_a_byte_string_with_a_one_byte_length() [io]
+    var info: Vec[u8; 256] = Vec.new()
+    var idc = load256("000102030405060708090a0b0c0d0e0f10111213141516171819")
+    test.case("23 bytes: the head is 0x40 + 23 = 57")
+    oscctx.make_info(var info, 0, 0, true, var idc, 23, true)
+    test.assert_eq(info[2] as Int, 0x57)
+    test.assert_eq(info.len(), 1 + 1 + 1 + 23 + 1 + 4 + 1)
+    test.case("24 bytes: 58 18 then the bytes")
+    oscctx.make_info(var info, 0, 0, true, var idc, 24, true)
+    test.assert_eq(info[2] as Int, 0x58)
+    test.assert_eq(info[3] as Int, 24)
+    test.assert_eq(info[4] as Int, 0)
+    test.assert_eq(info.len(), 1 + 1 + 2 + 24 + 1 + 4 + 1)
+    test.case("derivation works with a context of 25 bytes")
+    var secret = load256("0102030405060708090a0b0c0d0e0f10")
+    var salt = load256("")
+    var c = oscctx.new_ctx()
+    test.assert_eq(oscctx.derive(var c, var secret, 16, var salt, 0, 0, 0, 1, 1, var idc, 25), oscctx.OSC_CTX_OK)

@@ -1,0 +1,433 @@
+// oscctx.nv — the OSCORE security context, RFC 8613 section 3.
+//
+// Two endpoints that share a master secret each hold a security context made
+// of a Common Context (the algorithms, the master secret and salt, the ID
+// Context, and the Common IV), a Sender Context (the Sender ID, the Sender Key
+// and the Sender Sequence Number) and a Recipient Context (the Recipient ID,
+// the Recipient Key and, on a server, the replay window).  The sender context
+// of one is the recipient context of the other.
+//
+// WHAT IS KEPT.  The master secret and the master salt are inputs to
+// `derive` and are not kept, which RFC 8613 section 3.1 allows: what is
+// kept is the Sender Key, the Recipient Key and the Common IV, 45 bytes, and
+// the identifiers.  The only algorithm is AES-CCM-16-64-128 with HKDF-SHA-256,
+// the one that RFC 8613 requires.
+//
+// IDENTIFIERS.  A Sender ID or Recipient ID is at most 7 bytes for a 13-byte
+// nonce (section 3.3), so it is an `Int` holding the bytes, the first in the
+// highest position, with a length; the empty identifier is length 0 and is a
+// valid one.  The ID Context is up to 32 bytes in a `Vec[u8; 32]` and may be
+// absent, which is not the same as empty: it is `nil` and not `h''` in the key
+// derivation.
+//
+// THE NONCE (section 5.2).  The Partial IV left-padded to 5 bytes, the sender's
+// ID left-padded to 7, and the length of the ID in front, 13 bytes, XORed with
+// the Common IV.  So no two senders share a nonce, and one sender shares none
+// with itself, so long as its Partial IVs differ.
+//
+// THE SEQUENCE NUMBER (sections 3.2.2, 7.2).  It starts at 0, is the Partial IV
+// of the next request, and must stay below 2^40; past that `ssn_next` answers
+// -1 and the context sends nothing more.  A device that loses RAM must not
+// reuse a number, so `ssn_needs_store` and `ssn_restore` are the procedure of
+// Appendix B.1.1: store the number before using one that is a multiple of K, and
+// after a reboot start from the stored number plus K plus F.
+//
+// THE REPLAY WINDOW (section 7.4).  A window of 32 on the highest Partial IV
+// accepted: a number above it is new, a number within 32 below it is new if its
+// bit is clear, and anything older is refused.  `replay_floor` is the lower
+// limit that Appendix B.1.2 sets after a reboot.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.
+
+use osckdf
+
+// The COSE number of AES-CCM-16-64-128.
+pub const OSC_ALG_AES_CCM_16_64_128 = 10
+// The size of a key, in bytes.
+pub const OSC_KEY_LEN = 16
+// The size of the Common IV and of the nonce, in bytes.
+pub const OSC_NONCE_LEN = 13
+// The longest Sender ID or Recipient ID: the nonce length less six.
+pub const OSC_ID_MAX = 7
+// The longest ID Context this package holds.
+pub const OSC_IDCTX_MAX = 32
+// The greatest Sender Sequence Number: 2^40 - 1.
+pub const OSC_SSN_MAX = 1099511627775
+// The size of the replay window.
+pub const OSC_REPLAY_WINDOW = 32
+
+// The context derived.
+pub const OSC_CTX_OK = 0
+// An ID is longer than 7 bytes, or its length is negative.
+pub const OSC_CTX_BAD_ID = 1
+// The master secret, the salt or the ID Context is longer than this package holds.
+pub const OSC_CTX_TOO_LONG = 2
+
+// The ID Context.
+pub alias IdContext = Vec[u8; 32]
+// A key of 128 bits.
+pub alias OscKey = Vec[u8; 16]
+// The Common IV or a nonce.
+pub alias OscNonce = Vec[u8; 13]
+
+// A security context.
+//
+// `sender_id` and `recipient_id` hold their bytes with the first in the highest
+// of `*_len` bytes.  `has_id_context` says whether `id_context` is in use.
+// `ssn` is the Sender Sequence Number, the Partial IV of the next request.  The
+// replay window is `win_top`, the highest Partial IV accepted, valid when
+// `win_any`, and `win_mask`, one bit for each of the 32 numbers up to `win_top`
+// that has been accepted, bit 0 being `win_top`; `win_floor` is the lowest
+// Partial IV that is accepted at all.
+pub @value
+struct OscoreCtx
+    sender_id: Int
+    sender_id_len: Int
+    recipient_id: Int
+    recipient_id_len: Int
+    has_id_context: Bool
+    id_context: IdContext
+    sender_key: OscKey
+    recipient_key: OscKey
+    common_iv: OscNonce
+    ssn: Int
+    win_any: Bool
+    win_top: Int
+    win_mask: Int
+    win_floor: Int
+
+// A context with nothing in it, to be filled by `derive`.
+//
+// ```novo
+// use oscctx
+//
+// fn main() [io]
+//     let c = oscctx.new_ctx()
+//     println("${c.ssn} ${c.win_any}")   // 0 false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn new_ctx() -> OscoreCtx []
+    OscoreCtx { sender_id: 0, sender_id_len: 0, recipient_id: 0, recipient_id_len: 0, has_id_context: false,
+                id_context: Vec.new(), sender_key: Vec.new(), recipient_key: Vec.new(), common_iv: Vec.new(), ssn: 0,
+                win_any: false, win_top: 0, win_mask: 0, win_floor: 0 }
+
+// Append the identifier of `len` bytes held in `id` to a buffer.
+@tier(embedded)
+@no_alloc
+fn push_id(var m: KdfBuf, id: Int, len: Int)
+    for i in 0..len
+        let _p = m.push(((id >> (8 * (len - 1 - i))) & 0xFF) as u8)
+
+// Append a CBOR byte string head for a length below 256.
+@tier(embedded)
+@no_alloc
+fn push_bstr_head(var m: KdfBuf, len: Int)
+    if len < 24
+        let _a = m.push((0x40 + len) as u8)
+    else
+        let _b = m.push(0x58)
+        let _c = m.push(len as u8)
+
+// The `info` of RFC 8613 section 3.2.1 for one derived value:
+//
+//   [ id : bstr, id_context : bstr / nil, alg_aead : int, type : tstr, L : uint ]
+//
+// as CBOR, in `info`, emptied first.  `kind_key` says "Key" (L 16) and not "IV"
+// (L 13); `has_ctx` false writes `nil` for the ID Context.
+//
+// ```novo
+// use oscctx
+//
+// fn main() [io]
+//     // RFC 8613 appendix C.1.1, the sender key: the empty ID, no ID Context, "Key", 16.
+//     var info: Vec[u8; 256] = Vec.new()
+//     var none: Vec[u8; 256] = Vec.new()
+//     oscctx.make_info(var info, 0, 0, false, var none, 0, true)
+//     println("${info.len()} ${info[1]} ${info[2]} ${info[8]}")   // 9 64 246 16
+// ```
+pub @tier(embedded)
+@no_alloc
+fn make_info(var info: KdfBuf, id: Int, id_len: Int, has_ctx: Bool, var ctx: KdfBuf, ctx_len: Int,
+             kind_key: Bool) []
+    info.clear()
+    let _a = info.push(0x85)
+    push_bstr_head(var info, id_len)
+    push_id(var info, id, id_len)
+    if has_ctx
+        push_bstr_head(var info, ctx_len)
+        for i in 0..ctx_len
+            let _b = info.push(ctx[i])
+    else
+        let _c = info.push(0xF6)
+    let _d = info.push(OSC_ALG_AES_CCM_16_64_128 as u8)
+    if kind_key
+        let _e = info.push(0x63)
+        let _f = info.push(0x4B)
+        let _g = info.push(0x65)
+        let _h = info.push(0x79)
+        let _i = info.push(OSC_KEY_LEN as u8)
+    else
+        let _j = info.push(0x62)
+        let _k = info.push(0x49)
+        let _l = info.push(0x56)
+        let _m = info.push(OSC_NONCE_LEN as u8)
+
+// One derived value: the first `want` bytes of HKDF-Expand(prk, info) into `out`.
+@tier(embedded)
+@no_alloc
+fn derive_one(var prk: Digest, var info: KdfBuf, var out: Vec[u8; 16], var iv: OscNonce, want: Int,
+              to_iv: Bool)
+    var t1: Digest = Vec.new()
+    osckdf.hkdf_expand_first(var prk, var info, info.len(), var t1)
+    if to_iv
+        iv.clear()
+        for i in 0..want
+            let _a = iv.push(t1[i])
+    else
+        out.clear()
+        for i in 0..want
+            let _b = out.push(t1[i])
+
+// Derive a security context from a master secret (RFC 8613 section 3.2.1).
+//
+// `secret` and `salt` are buffers with their lengths; a `salt_len` of 0 is no
+// salt, which HKDF treats as 32 zero bytes.  `sender_id` and `recipient_id`
+// are identifiers of `sender_len` and `recipient_len` bytes, 0 through 7, held
+// in an `Int` with the first byte highest.  `id_context` is the ID Context of
+// `ctx_len` bytes, or `ctx_len` -1 for none: an empty ID Context, `ctx_len` 0,
+// differs from none in the keys it derives.
+//
+// The context is overwritten: the sender key `HKDF(salt, secret, [sender_id,
+// id_context, 10, "Key", 16])`, the recipient key the same with the recipient
+// ID, and the Common IV with an empty ID, the type "IV" and length 13; the
+// sequence number is 0 and the replay window empty.
+//
+// Answers `OSC_CTX_OK`, `OSC_CTX_BAD_ID` for an identifier over 7 bytes, and
+// `OSC_CTX_TOO_LONG` for a secret over 192 bytes, a salt over 256 or an ID
+// Context over 32.
+//
+// ```novo
+// use oscctx
+//
+// fn main() [io]
+//     // RFC 8613 appendix C.2.1, the client: no salt, sender ID 00, recipient ID 01.
+//     var secret: Vec[u8; 256] = Vec.new()
+//     for i in 1..17
+//         let _a = secret.push(i as u8)
+//     var salt: Vec[u8; 256] = Vec.new()
+//     var none: Vec[u8; 256] = Vec.new()
+//     var c = oscctx.new_ctx()
+//     let r = oscctx.derive(var c, var secret, 16, var salt, 0, 0, 1, 1, 1, var none, -1)
+//     println("${r} ${c.sender_key[0]} ${c.recipient_key[0]} ${c.common_iv[0]}")   // 0 50 229 190
+// ```
+pub @tier(embedded)
+@no_alloc
+fn derive(var c: OscoreCtx, var secret: KdfBuf, secret_len: Int, var salt: KdfBuf, salt_len: Int,
+          sender_id: Int, sender_len: Int, recipient_id: Int, recipient_len: Int,
+          var id_context: KdfBuf, ctx_len: Int) -> Int []
+    if sender_len < 0 or sender_len > OSC_ID_MAX or recipient_len < 0 or recipient_len > OSC_ID_MAX
+        return OSC_CTX_BAD_ID
+    if secret_len > 192 or salt_len > 256 or ctx_len > OSC_IDCTX_MAX or secret_len < 0 or salt_len < 0
+        return OSC_CTX_TOO_LONG
+    var prk: Digest = Vec.new()
+    osckdf.hkdf_extract(var salt, salt_len, var secret, secret_len, var prk)
+    let has_ctx = ctx_len >= 0
+    var info: KdfBuf = Vec.new()
+    var skey: Vec[u8; 16] = Vec.new()
+    var rkey: Vec[u8; 16] = Vec.new()
+    var civ: OscNonce = Vec.new()
+    var unused_iv: OscNonce = Vec.new()
+    var unused_key: Vec[u8; 16] = Vec.new()
+    make_info(var info, sender_id, sender_len, has_ctx, var id_context, ctx_len, true)
+    derive_one(var prk, var info, var skey, var unused_iv, OSC_KEY_LEN, false)
+    make_info(var info, recipient_id, recipient_len, has_ctx, var id_context, ctx_len, true)
+    derive_one(var prk, var info, var rkey, var unused_iv, OSC_KEY_LEN, false)
+    make_info(var info, 0, 0, has_ctx, var id_context, ctx_len, false)
+    derive_one(var prk, var info, var unused_key, var civ, OSC_NONCE_LEN, true)
+    c.sender_id = sender_id
+    c.sender_id_len = sender_len
+    c.recipient_id = recipient_id
+    c.recipient_id_len = recipient_len
+    c.has_id_context = has_ctx
+    c.id_context.clear()
+    for i in 0..ctx_len
+        let _p = c.id_context.push(id_context[i])
+    c.sender_key = skey
+    c.recipient_key = rkey
+    c.common_iv = civ
+    c.ssn = 0
+    c.win_any = false
+    c.win_top = 0
+    c.win_mask = 0
+    c.win_floor = 0
+    OSC_CTX_OK
+
+// The nonce of RFC 8613 section 5.2: the length of `id` as a byte, `id` padded
+// on the left with zeros to 7 bytes, the Partial IV `piv` padded on the left
+// to 5 bytes, all XORed with the Common IV.  `id` is the Sender ID of the
+// endpoint that made the Partial IV, and `piv` its value as a number below 2^40.
+//
+// ```novo
+// use oscctx
+//
+// fn main() [io]
+//     // RFC 8613 appendix C.4: the sender ID is empty and the Partial IV 0x14.
+//     var civ: Vec[u8; 13] = Vec.new()
+//     for b in [0x46, 0x22, 0xd4, 0xdd, 0x6d, 0x94, 0x41, 0x68, 0xee, 0xfb, 0x54, 0x98, 0x7c]
+//         let _a = civ.push(b as u8)
+//     let n = oscctx.nonce(var civ, 0, 0, 0x14)
+//     println("${n[0]} ${n[12]}")   // 70 104
+// ```
+pub @tier(embedded)
+@no_alloc
+fn nonce(var civ: OscNonce, id: Int, id_len: Int, piv: Int) -> OscNonce []
+    var n: OscNonce = Vec.new()
+    for _i in 0..13
+        let _p = n.push(0)
+    n[0] = id_len as u8
+    // The identifier in bytes 1 to 7, right aligned.
+    for i in 0..id_len
+        n[7 - i] = ((id >> (8 * i)) & 0xFF) as u8
+    // The Partial IV in bytes 8 to 12, right aligned.
+    for i in 0..5
+        n[12 - i] = ((piv >> (8 * i)) & 0xFF) as u8
+    for i in 0..13
+        n[i] = (n[i] as Int ^ civ[i] as Int) as u8
+    n
+
+// The number of bytes of a Partial IV: the value without leading zero bytes,
+// and one byte for 0 (RFC 8613 section 5).
+//
+// ```novo
+// use oscctx
+//
+// fn main() [io]
+//     println("${oscctx.piv_len(0)} ${oscctx.piv_len(255)} ${oscctx.piv_len(256)}")   // 1 1 2
+// ```
+pub @tier(embedded)
+@no_alloc
+fn piv_len(piv: Int) -> Int []
+    var n = 1
+    for k in 1..5
+        if (piv >> (8 * k)) != 0
+            n = k + 1
+    n
+
+// Take the Sender Sequence Number for a message: answers the number and
+// advances the counter, or -1 once the counter has passed 2^40 - 1, when the
+// context sends nothing more (RFC 8613 section 7.2.1).
+//
+// ```novo
+// use oscctx
+//
+// fn main() [io]
+//     var c = oscctx.new_ctx()
+//     println("${oscctx.ssn_next(var c)} ${oscctx.ssn_next(var c)}")   // 0 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn ssn_next(var c: OscoreCtx) -> Int []
+    if c.ssn > OSC_SSN_MAX
+        return -1
+    let n = c.ssn
+    c.ssn = c.ssn + 1
+    n
+
+// Whether the Sender Sequence Number about to be used is one that has to be
+// written to non-volatile memory first: a multiple of `k`.
+//
+// This is the first half of the procedure of RFC 8613 Appendix B.1.1.  Before
+// `ssn_next` hands out a number divisible by `k`, the caller stores it; after a
+// reboot `ssn_restore` starts above anything that was used.
+pub @tier(embedded)
+@no_alloc
+fn ssn_needs_store(c: OscoreCtx, k: Int) -> Bool []
+    k > 0 and c.ssn % k == 0
+
+// Set the Sender Sequence Number after a reboot from the number that was stored
+// last: `stored + k + f`, where `k` is the interval of the stores and `f` is a
+// margin that covers a store that did not complete (Appendix B.1.1).  Answers
+// false, and changes nothing, when `k` or `f` is not positive or the sum would
+// pass 2^40 - 1.
+pub @tier(embedded)
+@no_alloc
+fn ssn_restore(var c: OscoreCtx, stored: Int, k: Int, f: Int) -> Bool []
+    if k <= 0 or f <= 0 or stored < 0 or stored + k + f > OSC_SSN_MAX
+        return false
+    c.ssn = stored + k + f
+    true
+
+// Whether a Partial IV may be accepted: it has not been received before and is
+// not older than the window (RFC 8613 section 7.4).  This does not change the
+// window; `replay_commit` does, after the message has verified.
+//
+// ```novo
+// use oscctx
+//
+// fn main() [io]
+//     var c = oscctx.new_ctx()
+//     oscctx.replay_commit(var c, 5)
+//     println("${oscctx.replay_ok(c, 5)} ${oscctx.replay_ok(c, 4)} ${oscctx.replay_ok(c, 6)}")   // false true true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn replay_ok(c: OscoreCtx, piv: Int) -> Bool []
+    if piv < c.win_floor or piv > OSC_SSN_MAX
+        return false
+    if not c.win_any
+        return true
+    if piv > c.win_top
+        return true
+    let back = c.win_top - piv
+    if back >= OSC_REPLAY_WINDOW
+        return false
+    ((c.win_mask >> back) & 1) == 0
+
+// Record a Partial IV as received.  The window moves up when the number is
+// above the highest so far, and a number inside the window sets its bit.
+pub @tier(embedded)
+@no_alloc
+fn replay_commit(var c: OscoreCtx, piv: Int) []
+    if not c.win_any
+        c.win_any = true
+        c.win_top = piv
+        c.win_mask = 1
+    else if piv > c.win_top
+        let shift = piv - c.win_top
+        if shift >= OSC_REPLAY_WINDOW
+            c.win_mask = 1
+        else
+            c.win_mask = ((c.win_mask << shift) | 1) & 0xFFFFFFFF
+        c.win_top = piv
+    else
+        c.win_mask = c.win_mask | (1 << (c.win_top - piv))
+
+// Refuse every Partial IV below `piv`: the lower limit that a server sets from a
+// request it has verified as fresh after it lost its state (RFC 8613
+// Appendix B.1.2).
+pub @tier(embedded)
+@no_alloc
+fn replay_floor(var c: OscoreCtx, piv: Int) []
+    c.win_floor = piv
+
+// Whether a Recipient Context is the one a request names: the Recipient ID
+// equals the `kid` the request carries, and an ID Context in the request, when
+// there is one, equals the context's.  A request without a `kid context`
+// matches whatever the context's ID Context is; the caller that requires one
+// checks `has_id_context` itself.
+pub @tier(embedded)
+@no_alloc
+fn recipient_matches(c: OscoreCtx, kid: Int, kid_len: Int, has_kid_ctx: Bool,
+                     var kid_ctx: IdContext) -> Bool []
+    if c.recipient_id_len != kid_len or c.recipient_id != kid
+        return false
+    if not has_kid_ctx
+        return true
+    if not c.has_id_context or c.id_context.len() != kid_ctx.len()
+        return false
+    var same = true
+    for i in 0..kid_ctx.len()
+        if kid_ctx[i] != c.id_context[i]
+            same = false
+    same

@@ -1,0 +1,22 @@
+[package]
+name        = "oscore-nv"
+version     = "0.1.0"
+description = "Object Security for Constrained RESTful Environments, RFC 8613, for novo-lang: the security context and its HKDF derivation, the AEAD nonce, the partial IV and the sender sequence number with the replay window of the recipient, the compressed COSE object and the OSCORE option, and the protection and verification of a CoAP request and response with the inner and outer option classes and the Observe handling.  AES-CCM-16-64-128 of RFC 3610 and HMAC-SHA-256 are in the package.  Over buffers the caller owns, with no allocation."
+license     = "Apache-2.0"
+stability   = "experimental"
+layer       = "core"
+category    = "crypto"
+tags        = ["oscore", "rfc8613", "coap", "aes-ccm", "hkdf", "cose", "iot", "end-to-end", "replay-window", "embedded", "no-alloc"]
+repository  = "https://github.com/novolang/oscore-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.23.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "End-to-end protection of CoAP messages with OSCORE, on a device with no heap"
+
+[dependencies]
+crypto-nv = "^0.1.8"
+coap-nv   = { path = "../coap-nv" }
