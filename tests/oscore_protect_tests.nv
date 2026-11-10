@@ -20,7 +20,6 @@ use std.bytes
 use std.str
 use oscctx
 use oscccm
-use oscopt
 use oscmsg
 
 fn h(s: Str) -> Bytes

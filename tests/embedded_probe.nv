@@ -15,11 +15,9 @@
 // the master secret of RFC 8613 appendix C.1, protects the GET request of C.4 at
 // sequence number 20 and checks the bytes against the RFC's, verifies it as the
 // server and refuses a copy as a replay, protects the response of C.7 and checks
-// those bytes, verifies it as the client, and checks AES-CCM against the packet
-// vector 1 of RFC 3610.
+// those bytes, and verifies it as the client.
 
 use oscctx
-use oscccm
 use oscmsg
 
 // The master salt of appendix C.1.
