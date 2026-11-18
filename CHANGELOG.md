@@ -5,6 +5,15 @@ All notable changes to oscore-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.1
+
+### Changed
+
+- The dependency on coap-nv is the range `^0.2.0`.  coap-nv 0.2.0 marks the
+  members of `CoapResources` as trait members and removes `CoapNoResources`;
+  this package uses neither, so nothing in it changes.  The toolchain floor is
+  0.26.0, which coap-nv 0.2.0 needs.
+
 ## 0.1.0
 
 The first release.
